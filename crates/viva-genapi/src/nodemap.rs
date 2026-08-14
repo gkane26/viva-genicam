@@ -335,6 +335,40 @@ impl NodeMap {
         Ok(())
     }
 
+    /// Effective `(min, max, inc)` for an Integer feature.
+    ///
+    /// A `<pMin>`/`<pMax>`/`<pInc>` declared on the node is resolved
+    /// dynamically through the same formula/register machinery predicates
+    /// use, taking priority over the static literal `<Min>`/`<Max>`/
+    /// `<Increment>` GenApi falls back to when no dynamic form is declared.
+    /// Real GigE Vision cameras commonly make `Width`/`Height`/`OffsetX`/
+    /// `OffsetY`'s bounds dynamic this way (e.g. a minimum that depends on
+    /// the current binning factor) rather than declaring a fixed literal —
+    /// reading only the static fields, as this crate did before, silently
+    /// reports the unhelpful full-range default (`i64::MIN..i64::MAX`, `inc
+    /// = None`) for exactly the features callers most need real bounds for.
+    /// `inc` is `None` when the camera declares neither form (GenICam
+    /// permits an unconstrained increment).
+    pub fn integer_bounds(&self, name: &str, io: &dyn RegisterIo) -> Result<(i64, i64, Option<i64>), GenApiError> {
+        let node = self.get_integer_node(name)?;
+        let mut stack = HashSet::new();
+        let min = match &node.p_min {
+            Some(provider) => round_to_i64(name, self.resolve_numeric(provider, io, &mut stack)?)?,
+            None => node.min,
+        };
+        stack.clear();
+        let max = match &node.p_max {
+            Some(provider) => round_to_i64(name, self.resolve_numeric(provider, io, &mut stack)?)?,
+            None => node.max,
+        };
+        stack.clear();
+        let inc = match &node.p_inc {
+            Some(provider) => Some(round_to_i64(name, self.resolve_numeric(provider, io, &mut stack)?)?),
+            None => node.inc,
+        };
+        Ok((min, max, inc))
+    }
+
     /// Read a floating point feature.
     pub fn get_float(&self, name: &str, io: &dyn RegisterIo) -> Result<f64, GenApiError> {
         match self.nodes.get(name) {
@@ -1184,6 +1218,39 @@ impl NodeMap {
     /// in any variables the caller binds directly (`FROM` and `OLD` on a
     /// write, which have no provider node to read).
     #[allow(clippy::too_many_arguments)]
+    /// Resolve a single formula variable to the value the AST should see.
+    ///
+    /// A `<pVariable>` whose declared `Name` follows GenICam's
+    /// `<Alias>.Entry.<EntryName>` syntax (the standard's idiom for
+    /// referencing a *specific* enumeration entry's constant value from a
+    /// Formula, independent of that enum's current live selection) resolves
+    /// to `EntryName`'s declared value on the `provider` enum node, not to
+    /// `provider`'s current value. Every other variable resolves as before:
+    /// whatever `provider`'s current value is.
+    fn resolve_formula_var(
+        &self,
+        var: &str,
+        provider: &str,
+        io: &dyn RegisterIo,
+        stack: &mut HashSet<String>,
+    ) -> Result<SkValue, GenApiError> {
+        if let Some(entry_name) = var.split_once(".Entry.").map(|(_, entry)| entry) {
+            let node = match self.nodes.get(provider) {
+                Some(Node::Enum(node)) => node,
+                Some(_) => return Err(GenApiError::Type(provider.to_string())),
+                None => return Err(GenApiError::NodeNotFound(provider.to_string())),
+            };
+            let entry = node.entries.iter().find(|e| e.name == entry_name).ok_or_else(|| {
+                GenApiError::EnumNoSuchEntry {
+                    node: provider.to_string(),
+                    entry: entry_name.to_string(),
+                }
+            })?;
+            return self.resolve_enum_entry_value(node, entry, io).map(SkValue::Int);
+        }
+        self.resolve_value(provider, io, stack)
+    }
+
     fn eval_formula(
         &self,
         name: &str,
@@ -1199,7 +1266,7 @@ impl NodeMap {
             if overrides.iter().any(|(ident, _)| ident == var) {
                 continue;
             }
-            values.insert(var.clone(), self.resolve_value(provider, io, stack)?);
+            values.insert(var.clone(), self.resolve_formula_var(var, provider, io, stack)?);
         }
         for (ident, value) in overrides {
             values.insert((*ident).to_string(), *value);
@@ -1663,6 +1730,7 @@ fn build_node(
             pvalue,
             p_max,
             p_min,
+            p_inc,
             value,
             predicates,
         } => {
@@ -1677,6 +1745,9 @@ fn build_node(
             }
             if let Some(ref pm) = p_min {
                 dependents.entry(pm.clone()).or_default().push(name.clone());
+            }
+            if let Some(ref pi) = p_inc {
+                dependents.entry(pi.clone()).or_default().push(name.clone());
             }
             for (selector, _) in &selected_if {
                 dependents
@@ -1703,6 +1774,7 @@ fn build_node(
                 pvalue,
                 p_max,
                 p_min,
+                p_inc,
                 value,
                 predicates,
                 cache: std::cell::RefCell::new(None),

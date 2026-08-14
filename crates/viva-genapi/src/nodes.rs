@@ -227,6 +227,8 @@ pub struct IntegerNode {
     pub p_max: Option<String>,
     /// Node providing the dynamic minimum.
     pub p_min: Option<String>,
+    /// Node providing the dynamic increment.
+    pub p_inc: Option<String>,
     /// Static value for constant nodes.
     pub value: Option<i64>,
     /// Predicate refs gating implementation / availability / lock state.

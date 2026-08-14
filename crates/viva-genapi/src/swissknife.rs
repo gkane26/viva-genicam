@@ -952,6 +952,17 @@ impl<'a> Lexer<'a> {
         while let Some(byte) = self.peek() {
             if byte.is_ascii_alphanumeric() || byte == b'_' {
                 self.pos += 1;
+            } else if byte == b'.'
+                && matches!(self.peek_next(), Some(b) if b.is_ascii_alphanumeric() || b == b'_')
+            {
+                // GenICam's `<EnumNode>.Entry.<EntryName>` pVariable-name
+                // syntax embeds dots inside what is otherwise a single
+                // identifier (e.g. `EXPOSURE_MODE.Entry.Timed`). Only
+                // consumed when followed by another identifier character, so
+                // a trailing `.` (end of expression, or the start of a
+                // `<Node>.<member>` this language doesn't otherwise have)
+                // still ends the identifier rather than swallowing it.
+                self.pos += 1;
             } else {
                 break;
             }

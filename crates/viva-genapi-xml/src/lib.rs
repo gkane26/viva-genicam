@@ -650,6 +650,9 @@ pub enum NodeDecl {
         p_max: Option<String>,
         /// Node providing the dynamic minimum.
         p_min: Option<String>,
+        /// Node providing the dynamic increment.
+        #[serde(default)]
+        p_inc: Option<String>,
         /// Static value (for constant integer nodes with `<Value>`).
         value: Option<i64>,
         /// Predicate refs gating implementation / availability / lock state.

@@ -41,6 +41,7 @@ pub fn parse_integer(
     let mut pvalue = None;
     let mut p_max = None;
     let mut p_min = None;
+    let mut p_inc = None;
     let mut static_value: Option<i64> = None;
     let mut predicates = PredicateRefs::default();
     let mut selector_state = SelectorState::default();
@@ -77,6 +78,13 @@ pub fn parse_integer(
                     let target = text.trim();
                     if !target.is_empty() {
                         p_min = Some(target.to_string());
+                    }
+                }
+                b"pInc" => {
+                    let text = read_text_start(reader, e)?;
+                    let target = text.trim();
+                    if !target.is_empty() {
+                        p_inc = Some(target.to_string());
                     }
                 }
                 TAG_VALUE => {
@@ -296,6 +304,7 @@ pub fn parse_integer(
         pvalue,
         p_max,
         p_min,
+        p_inc,
         value: static_value,
         predicates,
     })

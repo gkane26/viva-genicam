@@ -152,6 +152,7 @@ pub fn parse_struct_reg(
                 pvalue: None,
                 p_max: None,
                 p_min: None,
+                p_inc: None,
                 value: None,
                 predicates: PredicateRefs::default(),
             }

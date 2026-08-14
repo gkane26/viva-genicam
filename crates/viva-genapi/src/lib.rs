@@ -775,6 +775,79 @@ mod tests {
         );
     }
 
+    // GenICam's `<EnumNode>.Entry.<EntryName>` variable-name syntax: a
+    // `<pVariable Name="X.Entry.Y">EnumNode</pVariable>` binds `X.Entry.Y` in
+    // the enclosing Formula to the *constant* declared value of EnumNode's
+    // entry named `Y`, regardless of EnumNode's current live value. A real
+    // Teledyne DALSA Genie Nano's `EXPOSURE_TIME_IS_LOCKED` formula (the
+    // node backing `ExposureTime`'s `pIsLocked`) depends on exactly this
+    // syntax (`EXPOSURE_MODE = EXPOSURE_MODE.Entry.Timed`) -- confirmed
+    // against real hardware, where this SwissKnife node was previously
+    // dropped entirely at nodemap-build time (see `nodemap.skipped()`)
+    // because the formula lexer could not tokenize the dotted identifier.
+    const ENUM_ENTRY_VARIABLE_FIXTURE: &str = r#"
+        <RegisterDescription SchemaMajorVersion="1" SchemaMinorVersion="0" SchemaSubMinorVersion="0">
+            <IntReg Name="ModeReg">
+                <Address>0x500</Address>
+                <Length>4</Length>
+                <AccessMode>RW</AccessMode>
+                <Sign>Unsigned</Sign>
+                <Endianess>BigEndian</Endianess>
+            </IntReg>
+            <Enumeration Name="Mode">
+                <EnumEntry Name="Timed"><Value>2</Value></EnumEntry>
+                <EnumEntry Name="Other"><Value>5</Value></EnumEntry>
+                <pValue>ModeReg</pValue>
+            </Enumeration>
+            <IntSwissKnife Name="IsTimed">
+                <pVariable Name="MODE">Mode</pVariable>
+                <pVariable Name="MODE.Entry.Timed">Mode</pVariable>
+                <Formula>(MODE = MODE.Entry.Timed)?1:0</Formula>
+            </IntSwissKnife>
+        </RegisterDescription>
+    "#;
+
+    fn build_enum_entry_variable_nodemap() -> NodeMap {
+        NodeMap::try_from_xml(
+            viva_genapi_xml::parse(ENUM_ENTRY_VARIABLE_FIXTURE).expect("parse fixture"),
+        )
+        .expect("build nodemap")
+    }
+
+    #[test]
+    fn swissknife_node_with_dotted_entry_variable_is_not_dropped() {
+        let nodemap = build_enum_entry_variable_nodemap();
+        assert!(
+            nodemap.skipped().is_empty(),
+            "IsTimed should build cleanly, got skipped nodes: {:?}",
+            nodemap.skipped()
+        );
+    }
+
+    #[test]
+    fn swissknife_resolves_dotted_entry_variable_to_the_entrys_constant_value() {
+        // Mode currently reads "Timed" (raw 2): MODE.Entry.Timed must compare
+        // equal to MODE's *own* live value here, so this alone can't tell a
+        // correct entry-constant resolution apart from a buggy
+        // resolve-the-live-value-twice implementation -- the "Other" case
+        // below is what actually distinguishes them.
+        let nm_timed = build_enum_entry_variable_nodemap();
+        let io_timed = MockIo::with_registers(&[(0x500, 2u32.to_be_bytes().to_vec())]);
+        assert_eq!(nm_timed.get_integer("IsTimed", &io_timed).unwrap(), 1);
+
+        // Mode currently reads "Other" (raw 5): MODE.Entry.Timed must still
+        // resolve to the constant 2 (Timed's declared value), not to Mode's
+        // current live value (5) -- a buggy implementation that just
+        // re-resolves the provider node's live value would wrongly compare
+        // 5 = 5 and report "locked"/"timed" here too. A fresh nodemap
+        // instance, not a second call against `nm_timed`: `IsTimed`'s own
+        // SwissKnife result is cached by generation, and nothing here goes
+        // through a `set_*` call to bump it.
+        let nm_other = build_enum_entry_variable_nodemap();
+        let io_other = MockIo::with_registers(&[(0x500, 5u32.to_be_bytes().to_vec())]);
+        assert_eq!(nm_other.get_integer("IsTimed", &io_other).unwrap(), 0);
+    }
+
     #[test]
     fn predicate_effective_access_mode_rw_when_unlocked() {
         let nodemap = build_predicate_nodemap();
@@ -1795,5 +1868,67 @@ mod tests {
             !visible.contains(&"InvisibleNode"),
             "Invisible node must NOT be visible at Guru level"
         );
+    }
+
+    // A real Teledyne DALSA Genie Nano's `Width` declares neither a literal
+    // `<Min>`/`<Max>`/`<Increment>` nor a `<pMax>` -- only `<pMin>` and
+    // `<pInc>`, each pointing at a SwissKnife formula (its `<Max>` comes from
+    // a *different* mechanism entirely: WidthMax/HeightMax, resolved
+    // elsewhere). Before this fix, `<pInc>` was not parsed at all, and a
+    // declared `<pMin>`/`<pMax>` was parsed but never resolved into an
+    // effective bound -- `IntegerNode::min`/`::max`/`::inc` stayed at their
+    // full-range/`None` defaults regardless, which is why
+    // `eyetracker-rs`'s GenICam backend reported `min_roi_width() == 0` and a
+    // wrong ROI-offset increment against real hardware.
+    const DYNAMIC_INTEGER_BOUNDS_FIXTURE: &str = r#"
+        <RegisterDescription SchemaMajorVersion="1" SchemaMinorVersion="0" SchemaSubMinorVersion="0">
+            <IntReg Name="FactorReg">
+                <Address>0x600</Address>
+                <Length>4</Length>
+                <AccessMode>RW</AccessMode>
+                <Sign>Unsigned</Sign>
+                <Endianess>BigEndian</Endianess>
+            </IntReg>
+            <IntSwissKnife Name="DynMin">
+                <pVariable Name="FACTOR">FactorReg</pVariable>
+                <Formula>FACTOR * 4</Formula>
+            </IntSwissKnife>
+            <IntSwissKnife Name="DynInc">
+                <pVariable Name="FACTOR">FactorReg</pVariable>
+                <Formula>FACTOR * 2</Formula>
+            </IntSwissKnife>
+            <Integer Name="Width">
+                <pMin>DynMin</pMin>
+                <pInc>DynInc</pInc>
+                <Value>0</Value>
+            </Integer>
+        </RegisterDescription>
+    "#;
+
+    fn build_dynamic_integer_bounds_nodemap() -> NodeMap {
+        NodeMap::try_from_xml(
+            viva_genapi_xml::parse(DYNAMIC_INTEGER_BOUNDS_FIXTURE).expect("parse fixture"),
+        )
+        .expect("build nodemap")
+    }
+
+    #[test]
+    fn integer_bounds_resolves_p_min_and_p_inc_dynamically() {
+        let nodemap = build_dynamic_integer_bounds_nodemap();
+        let io = MockIo::with_registers(&[(0x600, 3u32.to_be_bytes().to_vec())]); // FACTOR = 3
+        let (min, max, inc) = nodemap.integer_bounds("Width", &io).expect("resolve bounds");
+        assert_eq!(min, 12, "DynMin = FACTOR * 4 = 3 * 4");
+        assert_eq!(max, i64::MAX, "Width declares no <Max>/<pMax> at all");
+        assert_eq!(inc, Some(6), "DynInc = FACTOR * 2 = 3 * 2");
+    }
+
+    #[test]
+    fn integer_bounds_falls_back_to_static_fields_when_no_dynamic_ref() {
+        // `Gated` (from PREDICATE_FIXTURE) has literal Min=0/Max=255 and no
+        // pMin/pMax/pInc -- the fallback path this fixture doesn't exercise.
+        let nodemap = build_predicate_nodemap();
+        let io = predicate_io(1);
+        let (min, max, inc) = nodemap.integer_bounds("Gated", &io).expect("resolve bounds");
+        assert_eq!((min, max, inc), (0, 255, None));
     }
 }
