@@ -49,6 +49,11 @@ pub fn parse_integer(
     let mut buf = Vec::new();
     let mut bitfield = BitfieldBuilder::default();
     let mut pending_bit_length = false;
+    // Tracked separately from `bitfield`'s own byte order (which only
+    // matters for LSB/MSB bit-offset resolution when a bitfield is present):
+    // this is the whole-register byte order the plain (non-bitfield)
+    // bytes_to_i64/i64_to_bytes decode/encode path needs.
+    let mut byte_order: Option<ByteOrder> = None;
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -169,6 +174,7 @@ pub fn parse_integer(
                     let text = read_text_start(reader, e)?;
                     if let Some(order) = ByteOrder::parse(&text) {
                         bitfield.note_byte_order(order);
+                        byte_order = Some(order);
                     }
                 }
                 b"pSelected" => {
@@ -232,6 +238,7 @@ pub fn parse_integer(
                         && let Some(order) = ByteOrder::parse(&value)
                     {
                         bitfield.note_byte_order(order);
+                        byte_order = Some(order);
                     }
                 }
                 b"Selected" => {
@@ -283,6 +290,7 @@ pub fn parse_integer(
         unit,
         bitfield,
         sign,
+        byte_order: byte_order.unwrap_or(ByteOrder::Big),
         selectors,
         selected_if,
         pvalue,

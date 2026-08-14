@@ -6,14 +6,23 @@ use crate::GenApiError;
 use crate::bitops::BitOpsError;
 use crate::nodes::FloatNode;
 
-/// Convert a big-endian byte slice (up to 8 bytes) to a 64-bit integer.
+/// Convert a byte slice (up to 8 bytes) to a 64-bit integer, per `order`.
 ///
 /// `sign` decides whether the payload's top bit means "negative" or is just
 /// another value bit. GenICam defaults to [`Sign::Unsigned`], and getting it
 /// wrong is silent right up until a register's top bit is set: a
 /// `GevCurrentIPAddress` of `192.168.1.160` (`0xC0A801A0`) then reads as
 /// `-1062731360`.
-pub fn bytes_to_i64(name: &str, bytes: &[u8], sign: Sign) -> Result<i64, GenApiError> {
+///
+/// `order` must be the node's own declared `<Endianess>` (GenICam integer
+/// registers default to `BigEndian` when the tag is absent, same as
+/// `<Float>`/`<FloatReg>` — see `decode_ieee754`). Hardcoding big-endian here
+/// regardless of `order` was a real bug: it silently misdecoded every
+/// `LittleEndian`-declared `<Integer>`/`<IntReg>` node, confirmed against a
+/// real Teledyne DALSA Genie Nano whose Width/Height/OffsetX/OffsetY/
+/// WidthMax/HeightMax registers are all declared `LittleEndian` and all
+/// decoded wrong before this fix.
+pub fn bytes_to_i64(name: &str, bytes: &[u8], sign: Sign, order: ByteOrder) -> Result<i64, GenApiError> {
     if bytes.is_empty() {
         return Err(GenApiError::Parse(format!(
             "node {name} returned empty payload"
@@ -26,14 +35,29 @@ pub fn bytes_to_i64(name: &str, bytes: &[u8], sign: Sign) -> Result<i64, GenApiE
         )));
     }
     let mut buf = [0u8; 8];
-    let offset = 8 - bytes.len();
-    buf[offset..].copy_from_slice(bytes);
-    if sign.is_signed() && (bytes[0] & 0x80) != 0 {
-        for byte in &mut buf[..offset] {
-            *byte = 0xFF;
+    let value = match order {
+        ByteOrder::Big => {
+            let offset = 8 - bytes.len();
+            buf[offset..].copy_from_slice(bytes);
+            if sign.is_signed() && (bytes[0] & 0x80) != 0 {
+                for byte in &mut buf[..offset] {
+                    *byte = 0xFF;
+                }
+            }
+            i64::from_be_bytes(buf)
         }
-    }
-    let value = i64::from_be_bytes(buf);
+        ByteOrder::Little => {
+            buf[..bytes.len()].copy_from_slice(bytes);
+            // The sign bit lives in the *last* byte of a little-endian
+            // payload (its most significant byte), not the first.
+            if sign.is_signed() && (bytes[bytes.len() - 1] & 0x80) != 0 {
+                for byte in &mut buf[bytes.len()..] {
+                    *byte = 0xFF;
+                }
+            }
+            i64::from_le_bytes(buf)
+        }
+    };
     // A full-width unsigned register can hold values an i64 cannot. GenApi's
     // IInteger is int64, so there is nowhere to put them; say so rather than
     // hand back a negative number.
@@ -45,22 +69,25 @@ pub fn bytes_to_i64(name: &str, bytes: &[u8], sign: Sign) -> Result<i64, GenApiE
     Ok(value)
 }
 
-/// Convert a 64-bit integer to a big-endian byte vector of the given width.
+/// Convert a 64-bit integer to a byte vector of the given width, per `order`.
 pub fn i64_to_bytes(
     name: &str,
     value: i64,
     width: u32,
     sign: Sign,
+    order: ByteOrder,
 ) -> Result<Vec<u8>, GenApiError> {
     if width == 0 || width > 8 {
         return Err(GenApiError::Parse(format!(
             "node {name} has unsupported width {width}"
         )));
     }
-    let width = width as usize;
-    let bytes = value.to_be_bytes();
-    let data = bytes[8 - width..].to_vec();
-    let roundtrip = bytes_to_i64(name, &data, sign)?;
+    let width_usize = width as usize;
+    let data = match order {
+        ByteOrder::Big => value.to_be_bytes()[8 - width_usize..].to_vec(),
+        ByteOrder::Little => value.to_le_bytes()[..width_usize].to_vec(),
+    };
+    let roundtrip = bytes_to_i64(name, &data, sign, order)?;
     if roundtrip != value {
         return Err(GenApiError::Range(format!(
             "value {value} does not fit {width} bytes for {name}"
@@ -281,6 +308,55 @@ pub fn encode_ieee754(
         other => Err(GenApiError::Parse(format!(
             "node {name} unsupported IEEE-754 width {other}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bytes_to_i64_decodes_little_endian_when_declared() {
+        // The little-endian encoding of 288 (0x0120) in a 4-byte field is
+        // [0x20, 0x01, 0x00, 0x00] — this is a real value captured off a
+        // Teledyne DALSA Genie Nano's Width register, which declares
+        // <Endianess>LittleEndian</Endianess> in its own GenApi XML.
+        let bytes = [0x20u8, 0x01, 0x00, 0x00];
+        let value = bytes_to_i64("Width", &bytes, Sign::Unsigned, ByteOrder::Little).unwrap();
+        assert_eq!(value, 288);
+    }
+
+    #[test]
+    fn bytes_to_i64_decodes_big_endian_when_declared() {
+        let bytes = [0x00u8, 0x00, 0x01, 0x20];
+        let value = bytes_to_i64("Width", &bytes, Sign::Unsigned, ByteOrder::Big).unwrap();
+        assert_eq!(value, 288);
+    }
+
+    #[test]
+    fn bytes_to_i64_little_endian_sign_extends_from_the_last_byte() {
+        // -1 as a little-endian i32 is [0xFF, 0xFF, 0xFF, 0xFF] either way,
+        // so use a value whose sign bit only shows up in the last byte:
+        // -2 as little-endian i32 is [0xFE, 0xFF, 0xFF, 0xFF].
+        let bytes = [0xFEu8, 0xFF, 0xFF, 0xFF];
+        let value = bytes_to_i64("Offset", &bytes, Sign::Signed, ByteOrder::Little).unwrap();
+        assert_eq!(value, -2);
+    }
+
+    #[test]
+    fn i64_to_bytes_round_trips_little_endian() {
+        let bytes = i64_to_bytes("Width", 288, 4, Sign::Unsigned, ByteOrder::Little).unwrap();
+        assert_eq!(bytes, vec![0x20, 0x01, 0x00, 0x00]);
+        let roundtrip = bytes_to_i64("Width", &bytes, Sign::Unsigned, ByteOrder::Little).unwrap();
+        assert_eq!(roundtrip, 288);
+    }
+
+    #[test]
+    fn i64_to_bytes_round_trips_big_endian() {
+        let bytes = i64_to_bytes("Width", 288, 4, Sign::Unsigned, ByteOrder::Big).unwrap();
+        assert_eq!(bytes, vec![0x00, 0x00, 0x01, 0x20]);
+        let roundtrip = bytes_to_i64("Width", &bytes, Sign::Unsigned, ByteOrder::Big).unwrap();
+        assert_eq!(roundtrip, 288);
     }
 }
 
