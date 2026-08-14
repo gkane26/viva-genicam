@@ -499,7 +499,29 @@ fn eval_function(name: &str, args: &[Value], mode: EvalMode) -> Result<Value, Ev
         "trunc" => rounding_fn(f64::trunc),
         "floor" => rounding_fn(f64::floor),
         "ceil" => rounding_fn(f64::ceil),
-        "round" => rounding_fn(f64::round),
+        // Unlike the other rounding functions, GenICam's `ROUND` also
+        // accepts an optional second "digits" argument -- round to `digits`
+        // decimal places rather than to the nearest integer. A real Teledyne
+        // DALSA Genie Nano's `GainConverter` formula uses this 2-arg form
+        // (`ROUND(200 * LG(FROM), 0)`), which previously failed evaluation
+        // outright ("function ROUND expects 1 args, got 2").
+        "round" => match args {
+            [_] => rounding_fn(f64::round),
+            [value, digits] => {
+                let scale = 10f64.powi(digits.as_i64() as i32);
+                let rounded = (value.as_f64() * scale).round() / scale;
+                if mode == EvalMode::Integer || value.is_int() {
+                    Ok(Value::Int(rounded as i64))
+                } else {
+                    Ok(Value::Float(rounded))
+                }
+            }
+            _ => Err(EvalError::ArityMismatch {
+                name: name.to_string(),
+                expected: 2,
+                got: args.len(),
+            }),
+        },
         "abs" => expect_args(name, args, 1).map(|a| {
             if mode == EvalMode::Integer || a[0].is_int() {
                 Value::Int(a[0].as_i64().wrapping_abs())
@@ -1526,6 +1548,34 @@ mod tests {
         assert!((eval_expr("NEG(4)", &[]) + 4.0).abs() < 1e-9);
         // Names are case-insensitive.
         assert!((eval_expr("Sqrt(9)", &[]) - 3.0).abs() < 1e-9);
+    }
+
+    /// `ROUND` alone accepts an optional second "digits" argument (round to
+    /// `digits` decimal places) per the GenICam standard's SwissKnife
+    /// function list -- unlike `TRUNC`/`FLOOR`/`CEIL`, which stay 1-arg
+    /// only. A real Teledyne DALSA Genie Nano's `GainConverter` formula uses
+    /// exactly this form (`ROUND(200 * LG(FROM), 0)`), which failed
+    /// evaluation entirely with "function ROUND expects 1 args, got 2"
+    /// before this — confirmed against real hardware.
+    #[test]
+    fn round_accepts_an_optional_digits_argument() {
+        assert!((eval_expr("ROUND(3.14159, 2)", &[]) - 3.14).abs() < 1e-9);
+        assert!((eval_expr("ROUND(3.14159, 0)", &[]) - 3.0).abs() < 1e-9);
+        assert!((eval_expr("ROUND(2.5, 0)", &[]) - 3.0).abs() < 1e-9);
+        assert!((eval_expr("ROUND(-3.14159, 2)", &[]) + 3.14).abs() < 1e-9);
+        // 1-arg ROUND (round to nearest integer) keeps working unchanged.
+        assert!((eval_expr("ROUND(3.6)", &[]) - 4.0).abs() < 1e-9);
+        // The real formula this bug was found from.
+        assert!((eval_expr("ROUND(200 * LG(FROM), 0)", &[("FROM", 10.0)]) - 200.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn round_rejects_more_than_two_arguments() {
+        let ast = parse_expression("ROUND(1, 2, 3)").expect("parse failed");
+        let mut resolver =
+            |name: &str| -> Result<Value, EvalError> { Err(EvalError::UnknownVariable(name.to_string())) };
+        let err = evaluate(&ast, &mut resolver, EvalMode::Float).expect_err("ROUND must reject 3 arguments");
+        assert!(err.to_string().contains("ROUND"), "error should name ROUND: {err}");
     }
 
     #[test]
