@@ -76,7 +76,7 @@ pub fn parse_integer(
                         p_min = Some(target.to_string());
                     }
                 }
-                b"pInc" => {
+                "pInc" => {
                     let text = read_text_start(reader, e)?;
                     let target = text.trim();
                     if !target.is_empty() {
