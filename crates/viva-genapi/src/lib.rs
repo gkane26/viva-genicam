@@ -26,7 +26,7 @@ mod tests {
 
     use crate::conversions::{bytes_to_i64, i64_to_bytes};
     use crate::{AccessMode, GenApiError, NodeMap, RegisterIo, Visibility};
-    use viva_genapi_xml::Sign;
+    use viva_genapi_xml::{ByteOrder, Sign};
 
     const FIXTURE: &str = r#"
         <RegisterDescription SchemaMajorVersion="1" SchemaMinorVersion="2" SchemaSubMinorVersion="3">
@@ -130,15 +130,20 @@ mod tests {
                 <Max>65535</Max>
                 <Mask>0x0000FF00</Mask>
             </Integer>
+            <!-- The top three bits of a big-endian 16-bit word. Indices count
+                 down from the MSB here, so the field is 0..=2 and `<LSB>` is the
+                 larger of the two. This used to read `<Lsb>13</Lsb><Msb>15</Msb>`,
+                 an orientation that appears nowhere in the vendor corpus and
+                 encoded the issue-#120 defect rather than catching it. -->
             <Integer Name="BeBits">
                 <Address>0x5004</Address>
                 <Length>2</Length>
                 <AccessMode>RW</AccessMode>
                 <Min>0</Min>
                 <Max>15</Max>
-                <Lsb>13</Lsb>
-                <Msb>15</Msb>
-                <Endianness>BigEndian</Endianness>
+                <LSB>2</LSB>
+                <MSB>0</MSB>
+                <Endianess>BigEndian</Endianess>
             </Integer>
             <Boolean Name="PackedFlag">
                 <Address>0x5006</Address>
@@ -579,7 +584,7 @@ mod tests {
         let raw = 50_000i64;
         let io = MockIo::with_registers(&[(
             0x200,
-            i64_to_bytes("ExposureTime", raw, 4, Sign::Signed).unwrap(),
+            i64_to_bytes("ExposureTime", raw, 4, Sign::Signed, ByteOrder::Big).unwrap(),
         )]);
         let exposure = nodemap
             .get_float("ExposureTime", &io)
@@ -639,6 +644,199 @@ mod tests {
             </IntReg>
         </RegisterDescription>
     "#;
+
+    /// The FLIR gating shape from issue #120: three `<MaskedIntReg>` predicates
+    /// sharing one big-endian word, plus a `<Float>` that delegates through a
+    /// `<Converter>` — reproduced from `FLIR_BFS_PGE_31S4C_C.xml`.
+    const BIG_ENDIAN_PREDICATE_FIXTURE: &str = r#"
+        <RegisterDescription SchemaMajorVersion="1" SchemaMinorVersion="1" SchemaSubMinorVersion="1">
+            <Float Name="ExposureTime">
+                <pIsImplemented>ExposureTime_Imp</pIsImplemented>
+                <pIsAvailable>ExposureTime_Avl</pIsAvailable>
+                <pIsLocked>ExposureTime_Lck</pIsLocked>
+                <pValue>ExposureTime_FloatVal</pValue>
+            </Float>
+            <Converter Name="ExposureTime_FloatVal">
+                <FormulaTo>FROM</FormulaTo>
+                <FormulaFrom>TO</FormulaFrom>
+                <pValue>ExposureTime_Val</pValue>
+                <Slope>Increasing</Slope>
+            </Converter>
+            <IntReg Name="ExposureTime_Val">
+                <Address>0x000C1004</Address><Length>4</Length>
+                <AccessMode>RW</AccessMode><Sign>Unsigned</Sign>
+                <Endianess>BigEndian</Endianess>
+            </IntReg>
+            <MaskedIntReg Name="ExposureTime_Imp">
+                <Address>0x000C1000</Address><Length>4</Length>
+                <AccessMode>RO</AccessMode><Bit>0</Bit>
+                <Sign>Unsigned</Sign><Endianess>BigEndian</Endianess>
+            </MaskedIntReg>
+            <MaskedIntReg Name="ExposureTime_Avl">
+                <Address>0x000C1000</Address><Length>4</Length>
+                <AccessMode>RO</AccessMode><Bit>1</Bit>
+                <Sign>Unsigned</Sign><Endianess>BigEndian</Endianess>
+            </MaskedIntReg>
+            <MaskedIntReg Name="ExposureTime_Lck">
+                <Address>0x000C1000</Address><Length>4</Length>
+                <AccessMode>RO</AccessMode><Bit>3</Bit>
+                <Sign>Unsigned</Sign><Endianess>BigEndian</Endianess>
+            </MaskedIntReg>
+        </RegisterDescription>
+    "#;
+
+    fn big_endian_predicate_io(status: u32) -> MockIo {
+        MockIo::with_registers(&[
+            (0x000C_1000, status.to_be_bytes().to_vec()),
+            (0x000C_1004, 10_000u32.to_be_bytes().to_vec()),
+        ])
+    }
+
+    /// Regression for issue #120, stated against a register whose layout the
+    /// GigE Vision standard fixes rather than against our own reading of it.
+    ///
+    /// `AVT_Manta_G125B.xml` declares bootstrap `GevSCPSPacketSize` at `0xD04`
+    /// as `<LSB>31</LSB><MSB>16</MSB>` big-endian. The standard puts the packet
+    /// size in the *low* 16 bits, and the #120 reporter's own diagnostic bundle
+    /// shows that register holding `0x40000578` — 1400 bytes, with bit 0 (the
+    /// MSB) set for "fire test packet".
+    ///
+    /// So 1400 is not a number we chose: any implementation that disagrees is
+    /// wrong. Before the fix this produced 1 073 742 200 — the whole word —
+    /// because `<LSB>`/`<MSB>` were matched only in their mixed-case spelling
+    /// and the bit range was dropped entirely.
+    #[test]
+    fn big_endian_lsb_msb_range_decodes_the_gige_packet_size_register() {
+        const XML: &str = r#"
+            <RegisterDescription SchemaMajorVersion="1" SchemaMinorVersion="1" SchemaSubMinorVersion="1">
+                <MaskedIntReg Name="RegSCPSPacketSize">
+                    <Address>0xD04</Address><Length>4</Length>
+                    <AccessMode>RW</AccessMode>
+                    <LSB>31</LSB><MSB>16</MSB>
+                    <Endianess>BigEndian</Endianess>
+                </MaskedIntReg>
+            </RegisterDescription>
+        "#;
+        let nodemap =
+            NodeMap::try_from_xml(viva_genapi_xml::parse(XML).expect("parse")).expect("nodemap");
+        let io = MockIo::with_registers(&[(0x0D04, 0x4000_0578u32.to_be_bytes().to_vec())]);
+
+        assert_eq!(
+            nodemap.get_integer("RegSCPSPacketSize", &io).expect("read"),
+            1400
+        );
+    }
+
+    /// `<StructEntry>` and `<MaskedIntReg>` are two spellings of the same
+    /// physical bit and must decode identically.
+    ///
+    /// They are parsed by different functions — `parsers::struct_reg` and
+    /// `parsers::numeric` — and until #120 those two disagreed, with the
+    /// `<StructEntry>` path correct. Every predicate in `viva-fake-gige` used
+    /// `<StructEntry>` or `<IntSwissKnife>`, so the whole suite passed on the
+    /// path that worked while real cameras used the one that did not.
+    #[test]
+    fn struct_entry_and_masked_int_reg_agree_on_a_big_endian_bit() {
+        const XML: &str = r#"
+            <RegisterDescription SchemaMajorVersion="1" SchemaMinorVersion="1" SchemaSubMinorVersion="1">
+                <MaskedIntReg Name="ViaMaskedIntReg">
+                    <Address>0x500</Address><Length>4</Length>
+                    <AccessMode>RO</AccessMode><Bit>1</Bit>
+                    <Sign>Unsigned</Sign><Endianess>BigEndian</Endianess>
+                </MaskedIntReg>
+                <StructReg Comment="same word">
+                    <Address>0x500</Address><Length>4</Length>
+                    <AccessMode>RO</AccessMode><Sign>Unsigned</Sign>
+                    <Endianess>BigEndian</Endianess>
+                    <StructEntry Name="ViaStructEntry"><Bit>1</Bit></StructEntry>
+                </StructReg>
+            </RegisterDescription>
+        "#;
+        let nodemap =
+            NodeMap::try_from_xml(viva_genapi_xml::parse(XML).expect("parse")).expect("nodemap");
+
+        for word in [0x4000_0000u32, 0x0000_0002, 0xFFFF_FFFF, 0x0000_0000] {
+            let io = MockIo::with_registers(&[(0x500, word.to_be_bytes().to_vec())]);
+            let masked = nodemap.get_integer("ViaMaskedIntReg", &io).expect("masked");
+            let entry = nodemap.get_integer("ViaStructEntry", &io).expect("entry");
+            assert_eq!(masked, entry, "0x{word:08X} decoded differently");
+        }
+    }
+
+    /// The end-to-end shape of issue #120: a write refused locally as
+    /// unavailable because the gating bits were read off the wrong end.
+    ///
+    /// `0xC000_0000` is implemented (bit 0 from the MSB) and available (bit 1),
+    /// with the lock bit (bit 3) clear — the state a FLIR camera is in with
+    /// `ExposureAuto=Off`. Read LSB-first, as before the fix, the same word says
+    /// not implemented, and every setter refuses before reaching the wire.
+    #[test]
+    fn big_endian_gating_bits_permit_the_write_they_describe() {
+        let mut nodemap = NodeMap::try_from_xml(
+            viva_genapi_xml::parse(BIG_ENDIAN_PREDICATE_FIXTURE).expect("parse"),
+        )
+        .expect("nodemap");
+        let io = big_endian_predicate_io(0xC000_0000);
+
+        assert!(nodemap.is_implemented("ExposureTime", &io).expect("imp"));
+        assert!(nodemap.is_available("ExposureTime", &io).expect("avl"));
+        assert_eq!(
+            nodemap
+                .effective_access_mode("ExposureTime", &io)
+                .expect("access"),
+            AccessMode::RW
+        );
+
+        nodemap
+            .set_float("ExposureTime", 12_000.0, &io)
+            .expect("write must reach the wire");
+        assert_eq!(
+            io.regs.borrow().get(&0x000C_1004).cloned(),
+            Some(12_000u32.to_be_bytes().to_vec())
+        );
+    }
+
+    /// The lock bit is bit 3 counted from the MSB — `0x1000_0000`, not `0x8`.
+    ///
+    /// This is the guard added for issue #45. It could never have fired on that
+    /// reporter's camera, because it was reading bit 3 from the wrong end and
+    /// always saw zero; #120 is what exposed that.
+    #[test]
+    fn big_endian_lock_bit_is_counted_from_the_msb() {
+        let mut nodemap = NodeMap::try_from_xml(
+            viva_genapi_xml::parse(BIG_ENDIAN_PREDICATE_FIXTURE).expect("parse"),
+        )
+        .expect("nodemap");
+        let io = big_endian_predicate_io(0xD000_0000);
+
+        let err = nodemap
+            .set_float("ExposureTime", 12_000.0, &io)
+            .expect_err("locked");
+        assert!(
+            matches!(err, GenApiError::Locked { ref locked_by, .. } if locked_by == "ExposureTime_Lck"),
+            "expected Locked by ExposureTime_Lck, got {err:?}"
+        );
+    }
+
+    /// Clearing the availability bit alone must still refuse — and must say
+    /// "unavailable", not "locked". This is the message the #120 reporter saw,
+    /// reproduced from the state that genuinely warrants it.
+    #[test]
+    fn big_endian_availability_bit_refuses_the_write() {
+        let mut nodemap = NodeMap::try_from_xml(
+            viva_genapi_xml::parse(BIG_ENDIAN_PREDICATE_FIXTURE).expect("parse"),
+        )
+        .expect("nodemap");
+        let io = big_endian_predicate_io(0x8000_0000);
+
+        let err = nodemap
+            .set_float("ExposureTime", 12_000.0, &io)
+            .expect_err("unavailable");
+        assert!(
+            matches!(err, GenApiError::Unavailable(ref n) if n == "ExposureTime"),
+            "expected Unavailable, got {err:?}"
+        );
+    }
 
     fn build_predicate_nodemap() -> NodeMap {
         NodeMap::try_from_xml(
@@ -883,7 +1081,7 @@ mod tests {
         let raw = 50_000i64; // 50 ms with 1/1000 scale
         let io = MockIo::with_registers(&[(
             0x200,
-            i64_to_bytes("ExposureTime", raw, 4, Sign::Signed).unwrap(),
+            i64_to_bytes("ExposureTime", raw, 4, Sign::Signed, ByteOrder::Big).unwrap(),
         )]);
         let exposure = nodemap
             .get_float("ExposureTime", &io)
@@ -892,8 +1090,13 @@ mod tests {
         nodemap
             .set_float("ExposureTime", 75.0, &io)
             .expect("write exposure");
-        let raw_back =
-            bytes_to_i64("ExposureTime", &io.read(0x200, 4).unwrap(), Sign::Signed).unwrap();
+        let raw_back = bytes_to_i64(
+            "ExposureTime",
+            &io.read(0x200, 4).unwrap(),
+            Sign::Signed,
+            ByteOrder::Big,
+        )
+        .unwrap();
         assert_eq!(raw_back, 75_000);
     }
 
@@ -903,10 +1106,16 @@ mod tests {
         let io = MockIo::with_registers(&[
             (
                 0x300,
-                i64_to_bytes("GainSelector", 0, 2, Sign::Signed).unwrap(),
+                i64_to_bytes("GainSelector", 0, 2, Sign::Signed, ByteOrder::Big).unwrap(),
             ),
-            (0x310, i64_to_bytes("Gain", 10, 2, Sign::Signed).unwrap()),
-            (0x314, i64_to_bytes("Gain", 24, 2, Sign::Signed).unwrap()),
+            (
+                0x310,
+                i64_to_bytes("Gain", 10, 2, Sign::Signed, ByteOrder::Big).unwrap(),
+            ),
+            (
+                0x314,
+                i64_to_bytes("Gain", 24, 2, Sign::Signed, ByteOrder::Big).unwrap(),
+            ),
         ]);
 
         let gain_all = nodemap.get_integer("Gain", &io).expect("gain for All");
@@ -914,8 +1123,11 @@ mod tests {
         assert_eq!(io.read_count(0x310), 1);
         assert_eq!(io.read_count(0x314), 0);
 
-        io.write(0x314, &i64_to_bytes("Gain", 32, 2, Sign::Signed).unwrap())
-            .expect("update red gain");
+        io.write(
+            0x314,
+            &i64_to_bytes("Gain", 32, 2, Sign::Signed, ByteOrder::Big).unwrap(),
+        )
+        .expect("update red gain");
         nodemap
             .set_enum("GainSelector", "Red", &io)
             .expect("set selector to red");
@@ -948,8 +1160,11 @@ mod tests {
             "no read expected for missing mapping"
         );
 
-        io.write(0x310, &i64_to_bytes("Gain", 12, 2, Sign::Signed).unwrap())
-            .expect("update all gain");
+        io.write(
+            0x310,
+            &i64_to_bytes("Gain", 12, 2, Sign::Signed, ByteOrder::Big).unwrap(),
+        )
+        .expect("update all gain");
         nodemap
             .set_enum("GainSelector", "All", &io)
             .expect("restore selector to all");
@@ -989,10 +1204,16 @@ mod tests {
         let io = MockIo::with_registers(&[
             (
                 0x2000,
-                i64_to_bytes("RegAddr", 0x3000, 4, Sign::Signed).unwrap(),
+                i64_to_bytes("RegAddr", 0x3000, 4, Sign::Signed, ByteOrder::Big).unwrap(),
             ),
-            (0x3000, i64_to_bytes("Gain", 123, 4, Sign::Signed).unwrap()),
-            (0x3100, i64_to_bytes("Gain", 77, 4, Sign::Signed).unwrap()),
+            (
+                0x3000,
+                i64_to_bytes("Gain", 123, 4, Sign::Signed, ByteOrder::Big).unwrap(),
+            ),
+            (
+                0x3100,
+                i64_to_bytes("Gain", 77, 4, Sign::Signed, ByteOrder::Big).unwrap(),
+            ),
         ]);
 
         let initial = nodemap.get_integer("Gain", &io).expect("read gain");
@@ -1054,7 +1275,7 @@ mod tests {
         let nodemap = NodeMap::try_from_xml(model).expect("build nodemap");
         let io = MockIo::with_registers(&[(
             0x2000,
-            i64_to_bytes("RegAddr", -4, 4, Sign::Signed).unwrap(),
+            i64_to_bytes("RegAddr", -4, 4, Sign::Signed, ByteOrder::Big).unwrap(),
         )]);
 
         let err = nodemap.get_integer("Gain", &io).unwrap_err();
@@ -1142,7 +1363,7 @@ mod tests {
         let mut nodemap = NodeMap::try_from_xml(model).expect("build nodemap");
         let io = MockIo::with_registers(&[(
             0x1000,
-            i64_to_bytes("ExposureTimeRaw", 5000, 4, Sign::Unsigned).unwrap(),
+            i64_to_bytes("ExposureTimeRaw", 5000, 4, Sign::Unsigned, ByteOrder::Big).unwrap(),
         )]);
 
         // Read goes through FormulaFrom: 5000 / 100.
@@ -1185,7 +1406,14 @@ mod tests {
         let mut nodemap = NodeMap::try_from_xml(model).expect("build nodemap");
         let io = MockIo::with_registers(&[(
             0x1000,
-            i64_to_bytes("Binning_Reg", 0x0004_0002, 4, Sign::Unsigned).unwrap(),
+            i64_to_bytes(
+                "Binning_Reg",
+                0x0004_0002,
+                4,
+                Sign::Unsigned,
+                ByteOrder::Big,
+            )
+            .unwrap(),
         )]);
 
         assert_eq!(
@@ -1339,11 +1567,17 @@ mod tests {
         let io = MockIo::with_registers(&[
             (
                 0x2000,
-                i64_to_bytes("RegBase", 0x3000, 4, Sign::Signed).unwrap(),
+                i64_to_bytes("RegBase", 0x3000, 4, Sign::Signed, ByteOrder::Big).unwrap(),
             ),
             // Only the summed address holds the value we expect.
-            (0x3008, i64_to_bytes("Gain", 77, 4, Sign::Signed).unwrap()),
-            (0x3000, i64_to_bytes("Gain", 11, 4, Sign::Signed).unwrap()),
+            (
+                0x3008,
+                i64_to_bytes("Gain", 77, 4, Sign::Signed, ByteOrder::Big).unwrap(),
+            ),
+            (
+                0x3000,
+                i64_to_bytes("Gain", 11, 4, Sign::Signed, ByteOrder::Big).unwrap(),
+            ),
         ]);
 
         assert_eq!(nodemap.get_integer("Gain", &io).expect("read gain"), 77);
@@ -1391,15 +1625,15 @@ mod tests {
         let io = MockIo::with_registers(&[
             (
                 0x2000,
-                i64_to_bytes("TriggerSelectorIdx", 2, 4, Sign::Signed).unwrap(),
+                i64_to_bytes("TriggerSelectorIdx", 2, 4, Sign::Signed, ByteOrder::Big).unwrap(),
             ),
             (
                 0x13400,
-                i64_to_bytes("TriggerInqDelay", 1, 4, Sign::Signed).unwrap(),
+                i64_to_bytes("TriggerInqDelay", 1, 4, Sign::Signed, ByteOrder::Big).unwrap(),
             ),
             (
                 0x13480,
-                i64_to_bytes("TriggerInqDelay", 42, 4, Sign::Signed).unwrap(),
+                i64_to_bytes("TriggerInqDelay", 42, 4, Sign::Signed, ByteOrder::Big).unwrap(),
             ),
         ]);
 
@@ -1427,10 +1661,13 @@ mod tests {
     fn enum_literal_entry_read() {
         let nodemap = build_enum_pvalue_nodemap();
         let io = MockIo::with_registers(&[
-            (0x4000, i64_to_bytes("Mode", 10, 4, Sign::Signed).unwrap()),
+            (
+                0x4000,
+                i64_to_bytes("Mode", 10, 4, Sign::Signed, ByteOrder::Big).unwrap(),
+            ),
             (
                 0x4100,
-                i64_to_bytes("RegModeVal", 42, 4, Sign::Signed).unwrap(),
+                i64_to_bytes("RegModeVal", 42, 4, Sign::Signed, ByteOrder::Big).unwrap(),
             ),
         ]);
 
@@ -1447,10 +1684,13 @@ mod tests {
     fn enum_provider_entry_read() {
         let nodemap = build_enum_pvalue_nodemap();
         let io = MockIo::with_registers(&[
-            (0x4000, i64_to_bytes("Mode", 42, 4, Sign::Signed).unwrap()),
+            (
+                0x4000,
+                i64_to_bytes("Mode", 42, 4, Sign::Signed, ByteOrder::Big).unwrap(),
+            ),
             (
                 0x4100,
-                i64_to_bytes("RegModeVal", 42, 4, Sign::Signed).unwrap(),
+                i64_to_bytes("RegModeVal", 42, 4, Sign::Signed, ByteOrder::Big).unwrap(),
             ),
         ]);
 
@@ -1463,17 +1703,26 @@ mod tests {
     fn enum_set_uses_provider_value() {
         let mut nodemap = build_enum_pvalue_nodemap();
         let io = MockIo::with_registers(&[
-            (0x4000, i64_to_bytes("Mode", 0, 4, Sign::Signed).unwrap()),
+            (
+                0x4000,
+                i64_to_bytes("Mode", 0, 4, Sign::Signed, ByteOrder::Big).unwrap(),
+            ),
             (
                 0x4100,
-                i64_to_bytes("RegModeVal", 42, 4, Sign::Signed).unwrap(),
+                i64_to_bytes("RegModeVal", 42, 4, Sign::Signed, ByteOrder::Big).unwrap(),
             ),
         ]);
 
         nodemap
             .set_enum("Mode", "DynFromReg", &io)
             .expect("write enum");
-        let raw = bytes_to_i64("Mode", &io.read(0x4000, 4).unwrap(), Sign::Signed).unwrap();
+        let raw = bytes_to_i64(
+            "Mode",
+            &io.read(0x4000, 4).unwrap(),
+            Sign::Signed,
+            ByteOrder::Big,
+        )
+        .unwrap();
         assert_eq!(raw, 42);
         assert_eq!(io.read_count(0x4100), 1);
     }
@@ -1482,10 +1731,13 @@ mod tests {
     fn enum_provider_update_invalidates_mapping() {
         let mut nodemap = build_enum_pvalue_nodemap();
         let io = MockIo::with_registers(&[
-            (0x4000, i64_to_bytes("Mode", 42, 4, Sign::Signed).unwrap()),
+            (
+                0x4000,
+                i64_to_bytes("Mode", 42, 4, Sign::Signed, ByteOrder::Big).unwrap(),
+            ),
             (
                 0x4100,
-                i64_to_bytes("RegModeVal", 42, 4, Sign::Signed).unwrap(),
+                i64_to_bytes("RegModeVal", 42, 4, Sign::Signed, ByteOrder::Big).unwrap(),
             ),
         ]);
 
@@ -1495,13 +1747,22 @@ mod tests {
         nodemap
             .set_integer("RegModeVal", 17, &io)
             .expect("update provider");
-        io.write(0x4000, &i64_to_bytes("Mode", 0, 4, Sign::Signed).unwrap())
-            .expect("reset mode register");
+        io.write(
+            0x4000,
+            &i64_to_bytes("Mode", 0, 4, Sign::Signed, ByteOrder::Big).unwrap(),
+        )
+        .expect("reset mode register");
 
         nodemap
             .set_enum("Mode", "DynFromReg", &io)
             .expect("write enum after provider change");
-        let raw = bytes_to_i64("Mode", &io.read(0x4000, 4).unwrap(), Sign::Signed).unwrap();
+        let raw = bytes_to_i64(
+            "Mode",
+            &io.read(0x4000, 4).unwrap(),
+            Sign::Signed,
+            ByteOrder::Big,
+        )
+        .unwrap();
         assert_eq!(raw, 17);
     }
 
@@ -1509,10 +1770,13 @@ mod tests {
     fn enum_unknown_value_error() {
         let nodemap = build_enum_pvalue_nodemap();
         let io = MockIo::with_registers(&[
-            (0x4000, i64_to_bytes("Mode", 99, 4, Sign::Signed).unwrap()),
+            (
+                0x4000,
+                i64_to_bytes("Mode", 99, 4, Sign::Signed, ByteOrder::Big).unwrap(),
+            ),
             (
                 0x4100,
-                i64_to_bytes("RegModeVal", 42, 4, Sign::Signed).unwrap(),
+                i64_to_bytes("RegModeVal", 42, 4, Sign::Signed, ByteOrder::Big).unwrap(),
             ),
         ]);
 
@@ -1612,10 +1876,16 @@ mod tests {
         let io = MockIo::with_registers(&[
             (
                 0x3000,
-                i64_to_bytes("GainRaw", 100, 4, Sign::Signed).unwrap(),
+                i64_to_bytes("GainRaw", 100, 4, Sign::Signed, ByteOrder::Big).unwrap(),
             ),
-            (0x3008, i64_to_bytes("Offset", 3, 4, Sign::Signed).unwrap()),
-            (0x3010, i64_to_bytes("B", 1, 4, Sign::Signed).unwrap()),
+            (
+                0x3008,
+                i64_to_bytes("Offset", 3, 4, Sign::Signed, ByteOrder::Big).unwrap(),
+            ),
+            (
+                0x3010,
+                i64_to_bytes("B", 1, 4, Sign::Signed, ByteOrder::Big).unwrap(),
+            ),
         ]);
 
         let value = nodemap
@@ -1636,9 +1906,18 @@ mod tests {
     fn swissknife_integer_rounding_and_unary() {
         let mut nodemap = build_swissknife_nodemap();
         let io = MockIo::with_registers(&[
-            (0x3000, i64_to_bytes("GainRaw", 5, 4, Sign::Signed).unwrap()),
-            (0x3008, i64_to_bytes("Offset", 0, 4, Sign::Signed).unwrap()),
-            (0x3010, i64_to_bytes("B", 1, 4, Sign::Signed).unwrap()),
+            (
+                0x3000,
+                i64_to_bytes("GainRaw", 5, 4, Sign::Signed, ByteOrder::Big).unwrap(),
+            ),
+            (
+                0x3008,
+                i64_to_bytes("Offset", 0, 4, Sign::Signed, ByteOrder::Big).unwrap(),
+            ),
+            (
+                0x3010,
+                i64_to_bytes("B", 1, 4, Sign::Signed, ByteOrder::Big).unwrap(),
+            ),
         ]);
 
         // `<IntSwissKnife>` evaluates in integer arithmetic, so 5 / 3 truncates
@@ -1724,10 +2003,16 @@ mod tests {
         let io = MockIo::with_registers(&[
             (
                 0x3000,
-                i64_to_bytes("GainRaw", 10, 4, Sign::Signed).unwrap(),
+                i64_to_bytes("GainRaw", 10, 4, Sign::Signed, ByteOrder::Big).unwrap(),
             ),
-            (0x3008, i64_to_bytes("Offset", 0, 4, Sign::Signed).unwrap()),
-            (0x3010, i64_to_bytes("B", 0, 4, Sign::Signed).unwrap()),
+            (
+                0x3008,
+                i64_to_bytes("Offset", 0, 4, Sign::Signed, ByteOrder::Big).unwrap(),
+            ),
+            (
+                0x3010,
+                i64_to_bytes("B", 0, 4, Sign::Signed, ByteOrder::Big).unwrap(),
+            ),
         ]);
 
         let err = nodemap

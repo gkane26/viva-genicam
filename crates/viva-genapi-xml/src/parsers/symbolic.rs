@@ -6,9 +6,10 @@ use tracing::warn;
 
 use super::{
     NodeMetaBuilder, SelectorState, TAG_BIT, TAG_BYTE_ORDER, TAG_DISPLAY_NAME, TAG_ENDIANESS,
-    TAG_ENDIANNESS, TAG_LSB, TAG_MASK, TAG_MSB, TAG_P_ADDRESS, TAG_P_INDEX, TAG_P_VALUE, TAG_VALUE,
-    handle_addressing_empty, handle_addressing_start, handle_p_selected_empty,
-    handle_p_selected_start, handle_predicate_start, handle_selected_empty, handle_selected_start,
+    TAG_ENDIANNESS, TAG_LSB, TAG_LSB_MIXED, TAG_MASK, TAG_MSB, TAG_MSB_MIXED, TAG_P_ADDRESS,
+    TAG_P_INDEX, TAG_P_VALUE, TAG_VALUE, handle_addressing_empty, handle_addressing_start,
+    handle_p_selected_empty, handle_p_selected_start, handle_predicate_start,
+    handle_selected_empty, handle_selected_start,
 };
 use crate::builders::{AddressingBuilder, BitfieldBuilder, addressing_lengths};
 use crate::util::{
@@ -20,12 +21,12 @@ use crate::{
 
 /// Parse an `<Enumeration>` element into a [`NodeDecl::Enum`].
 pub fn parse_enum(reader: &mut Reader<&[u8]>, start: BytesStart<'_>) -> Result<NodeDecl, XmlError> {
-    let name = attribute_value_required(&start, b"Name")?;
+    let name = attribute_value_required(&start, "Name")?;
     let mut addressing = AddressingBuilder::default();
-    if let Some(addr) = attribute_value(&start, b"Address")? {
+    if let Some(addr) = attribute_value(&start, "Address")? {
         addressing.push_fixed_address(parse_u64(&addr)?);
     }
-    if let Some(len) = attribute_value(&start, b"Length")? {
+    if let Some(len) = attribute_value(&start, "Length")? {
         let value = parse_u64(&len)?;
         let len = u32::try_from(value)
             .map_err(|_| XmlError::Invalid(format!("length out of range for node {name}")))?;
@@ -36,7 +37,7 @@ pub fn parse_enum(reader: &mut Reader<&[u8]>, start: BytesStart<'_>) -> Result<N
     let mut default = None;
     let mut predicates = PredicateRefs::default();
     let mut selector_state = SelectorState::default();
-    let node_name = start.name().as_ref().to_vec();
+    let node_name = start.name().as_ref().to_string();
     let mut buf = Vec::new();
     let mut meta_builder = NodeMetaBuilder::default();
 
@@ -45,33 +46,33 @@ pub fn parse_enum(reader: &mut Reader<&[u8]>, start: BytesStart<'_>) -> Result<N
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) => match e.name().as_ref() {
-                b"pValue" => {
+                "pValue" => {
                     let text = read_text_start(reader, e)?;
                     let target = text.trim();
                     if !target.is_empty() {
                         pvalue = Some(target.to_string());
                     }
                 }
-                b"Address" | TAG_P_ADDRESS | TAG_P_INDEX | b"Length" => {
+                "Address" | TAG_P_ADDRESS | TAG_P_INDEX | "Length" => {
                     if !handle_addressing_start(reader, e, &name, &mut addressing)? {
                         skip_element(reader, e.name().as_ref())?;
                     }
                 }
-                b"AccessMode" => {
+                "AccessMode" => {
                     let text = read_text_start(reader, e)?;
                     access = AccessMode::parse(&text)?;
                 }
-                b"EnumEntry" => {
+                "EnumEntry" => {
                     let entry = parse_enum_entry(reader, e.clone())?;
                     entries.push(entry);
                 }
-                b"pSelected" => {
+                "pSelected" => {
                     handle_p_selected_start(reader, e, &mut addressing, &mut selector_state)?;
                 }
-                b"Selected" => {
+                "Selected" => {
                     handle_selected_start(reader, e, &name, &mut addressing, &mut selector_state)?;
                 }
-                b"pValueDefault" => {
+                "pValueDefault" => {
                     let text = read_text_start(reader, e)?;
                     let trimmed = text.trim();
                     if !trimmed.is_empty() {
@@ -87,19 +88,19 @@ pub fn parse_enum(reader: &mut Reader<&[u8]>, start: BytesStart<'_>) -> Result<N
                 }
             },
             Ok(Event::Empty(ref e)) => match e.name().as_ref() {
-                b"EnumEntry" => {
+                "EnumEntry" => {
                     let entry = parse_enum_entry_empty(e)?;
                     entries.push(entry);
                 }
-                b"pSelected" => {
+                "pSelected" => {
                     handle_p_selected_empty(e, &mut addressing, &mut selector_state)?;
                 }
-                b"Selected" => {
+                "Selected" => {
                     handle_selected_empty(e, &name, &mut addressing, &mut selector_state)?;
                 }
                 _ => {}
             },
-            Ok(Event::End(ref e)) if e.name().as_ref() == node_name.as_slice() => break,
+            Ok(Event::End(ref e)) if e.name().as_ref() == node_name.as_str() => break,
             Ok(Event::Eof) => {
                 return Err(XmlError::Invalid(format!(
                     "unterminated Enumeration node {name}"
@@ -141,12 +142,12 @@ pub fn parse_boolean(
     reader: &mut Reader<&[u8]>,
     start: BytesStart<'_>,
 ) -> Result<NodeDecl, XmlError> {
-    let name = attribute_value_required(&start, b"Name")?;
+    let name = attribute_value_required(&start, "Name")?;
     let mut addressing = AddressingBuilder::default();
-    if let Some(addr) = attribute_value(&start, b"Address")? {
+    if let Some(addr) = attribute_value(&start, "Address")? {
         addressing.push_fixed_address(parse_u64(&addr)?);
     }
-    if let Some(len) = attribute_value(&start, b"Length")? {
+    if let Some(len) = attribute_value(&start, "Length")? {
         let value = parse_u64(&len)?;
         let len = u32::try_from(value)
             .map_err(|_| XmlError::Invalid(format!("length out of range for node {name}")))?;
@@ -158,7 +159,7 @@ pub fn parse_boolean(
     let mut off_value = None;
     let mut predicates = PredicateRefs::default();
     let mut selector_state = SelectorState::default();
-    let node_name = start.name().as_ref().to_vec();
+    let node_name = start.name().as_ref().to_string();
     let mut buf = Vec::new();
     let mut meta_builder = NodeMetaBuilder::default();
     let mut bitfield = BitfieldBuilder::default();
@@ -167,27 +168,27 @@ pub fn parse_boolean(
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) => match e.name().as_ref() {
-                b"pValue" => {
+                "pValue" => {
                     let text = read_text_start(reader, e)?;
                     let target = text.trim();
                     if !target.is_empty() {
                         pvalue = Some(target.to_string());
                     }
                 }
-                b"OnValue" => {
+                "OnValue" => {
                     let text = read_text_start(reader, e)?;
                     on_value = Some(parse_i64(&text)?);
                 }
-                b"OffValue" => {
+                "OffValue" => {
                     let text = read_text_start(reader, e)?;
                     off_value = Some(parse_i64(&text)?);
                 }
                 // Shared handling so `<Address>`, `<pAddress>` and
                 // `<pIndex>` all contribute their term.
-                b"Address" | TAG_P_ADDRESS | TAG_P_INDEX => {
+                "Address" | TAG_P_ADDRESS | TAG_P_INDEX => {
                     handle_addressing_start(reader, e, &name, &mut addressing)?;
                 }
-                b"Length" => {
+                "Length" => {
                     let text = read_text_start(reader, e)?;
                     let value = parse_u64(&text)?;
                     let mut handled = false;
@@ -209,11 +210,11 @@ pub fn parse_boolean(
                         addressing.apply_length(len);
                     }
                 }
-                b"AccessMode" => {
+                "AccessMode" => {
                     let text = read_text_start(reader, e)?;
                     access = AccessMode::parse(&text)?;
                 }
-                TAG_LSB => {
+                TAG_LSB | TAG_LSB_MIXED => {
                     let text = read_text_start(reader, e)?;
                     let value = parse_u64(&text)?;
                     let lsb = u32::try_from(value).map_err(|_| {
@@ -221,7 +222,7 @@ pub fn parse_boolean(
                     })?;
                     bitfield.note_lsb(lsb);
                 }
-                TAG_MSB => {
+                TAG_MSB | TAG_MSB_MIXED => {
                     let text = read_text_start(reader, e)?;
                     let value = parse_u64(&text)?;
                     let msb = u32::try_from(value).map_err(|_| {
@@ -250,10 +251,10 @@ pub fn parse_boolean(
                         bitfield.note_byte_order(order);
                     }
                 }
-                b"pSelected" => {
+                "pSelected" => {
                     handle_p_selected_start(reader, e, &mut addressing, &mut selector_state)?;
                 }
-                b"Selected" => {
+                "Selected" => {
                     handle_selected_start(reader, e, &name, &mut addressing, &mut selector_state)?;
                 }
                 _ => {
@@ -265,13 +266,13 @@ pub fn parse_boolean(
                 }
             },
             Ok(Event::Empty(ref e)) => match e.name().as_ref() {
-                b"pSelected" => {
+                "pSelected" => {
                     handle_p_selected_empty(e, &mut addressing, &mut selector_state)?;
                 }
                 TAG_P_ADDRESS => {
                     handle_addressing_empty(e, &mut addressing)?;
                 }
-                TAG_LSB => {
+                TAG_LSB | TAG_LSB_MIXED => {
                     if let Some(value) = attribute_value(e, TAG_VALUE)? {
                         let parsed = parse_u64(&value)?;
                         let lsb = u32::try_from(parsed).map_err(|_| {
@@ -280,7 +281,7 @@ pub fn parse_boolean(
                         bitfield.note_lsb(lsb);
                     }
                 }
-                TAG_MSB => {
+                TAG_MSB | TAG_MSB_MIXED => {
                     if let Some(value) = attribute_value(e, TAG_VALUE)? {
                         let parsed = parse_u64(&value)?;
                         let msb = u32::try_from(parsed).map_err(|_| {
@@ -313,12 +314,12 @@ pub fn parse_boolean(
                         bitfield.note_byte_order(order);
                     }
                 }
-                b"Selected" => {
+                "Selected" => {
                     handle_selected_empty(e, &name, &mut addressing, &mut selector_state)?;
                 }
                 _ => {}
             },
-            Ok(Event::End(ref e)) if e.name().as_ref() == node_name.as_slice() => break,
+            Ok(Event::End(ref e)) if e.name().as_ref() == node_name.as_str() => break,
             Ok(Event::Eof) => {
                 return Err(XmlError::Invalid(format!(
                     "unterminated Boolean node {name}"
@@ -379,12 +380,12 @@ fn parse_enum_entry(
     reader: &mut Reader<&[u8]>,
     start: BytesStart<'_>,
 ) -> Result<EnumEntryDecl, XmlError> {
-    let mut name = attribute_value_required(&start, b"Name")?;
+    let mut name = attribute_value_required(&start, "Name")?;
     let mut literal = attribute_value(&start, TAG_VALUE)?;
     let mut provider = attribute_value(&start, TAG_P_VALUE)?;
     let mut display_name = attribute_value(&start, TAG_DISPLAY_NAME)?;
     let mut predicates = PredicateRefs::default();
-    let node_name = start.name().as_ref().to_vec();
+    let node_name = start.name().as_ref().to_string();
     let mut buf = Vec::new();
 
     loop {
@@ -411,7 +412,7 @@ fn parse_enum_entry(
                         display_name = Some(trimmed.to_string());
                     }
                 }
-                b"Name" => {
+                "Name" => {
                     let text = read_text_start(reader, e)?;
                     let trimmed = text.trim();
                     if !trimmed.is_empty() {
@@ -424,7 +425,7 @@ fn parse_enum_entry(
                     }
                 }
             },
-            Ok(Event::End(ref e)) if e.name().as_ref() == node_name.as_slice() => break,
+            Ok(Event::End(ref e)) if e.name().as_ref() == node_name.as_str() => break,
             Ok(Event::Eof) => {
                 return Err(XmlError::Invalid("unterminated EnumEntry element".into()));
             }
@@ -439,7 +440,7 @@ fn parse_enum_entry(
 
 /// Parse an empty `<EnumEntry />` element.
 fn parse_enum_entry_empty(start: &BytesStart<'_>) -> Result<EnumEntryDecl, XmlError> {
-    let name = attribute_value_required(start, b"Name")?;
+    let name = attribute_value_required(start, "Name")?;
     let literal = attribute_value(start, TAG_VALUE)?;
     let provider = attribute_value(start, TAG_P_VALUE)?;
     let display_name = attribute_value(start, TAG_DISPLAY_NAME)?;

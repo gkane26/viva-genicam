@@ -631,6 +631,11 @@ pub enum NodeDecl {
         /// Whether the register payload is signed. Defaults to unsigned.
         #[serde(default)]
         sign: Sign,
+        /// Byte order of the register payload. Defaults to [`ByteOrder::Big`]
+        /// (the GenICam default). Recorded here as well as on `bitfield`,
+        /// because an unmasked register has no bitfield to carry it.
+        #[serde(default = "default_big_endian")]
+        byte_order: ByteOrder,
         /// Selector nodes referencing this feature.
         selectors: Vec<String>,
         /// Selector gating rules in the form (selector name, allowed values).
@@ -833,8 +838,23 @@ pub struct MinimalXmlInfo {
     pub top_level_features: Vec<String>,
 }
 
+/// Drop a leading UTF-8 byte-order mark.
+///
+/// A BOM is valid UTF-8 (`U+FEFF`), so it survives `String::from_utf8` and
+/// reaches the parser intact; The Imaging Source's DMK 33GP2000e ships one
+/// (issue #122). quick-xml removes it from its own view of the input but does
+/// **not** advance `Reader::buffer_position`, so every offset it reports is
+/// three bytes short of the true offset into `xml`. [`parse`] slices node
+/// elements out of `xml` by those offsets, so each slice lost its closing `>`
+/// and every node in the document was skipped. Stripping here keeps quick-xml's
+/// positions and our `&str` talking about the same bytes.
+fn strip_bom(xml: &str) -> &str {
+    xml.strip_prefix('\u{feff}').unwrap_or(xml)
+}
+
 /// Parse a GenICam XML snippet and collect minimal metadata.
 pub fn parse_into_minimal_nodes(xml: &str) -> Result<MinimalXmlInfo, XmlError> {
+    let xml = strip_bom(xml);
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
     // Vendor XML is not ours to fix: a lone `&` in a tooltip must not stop us
@@ -873,26 +893,26 @@ pub fn parse_into_minimal_nodes(xml: &str) -> Result<MinimalXmlInfo, XmlError> {
 }
 
 /// `true` for tags this parser turns into one or more [`NodeDecl`]s.
-fn is_node_tag(tag: &[u8]) -> bool {
+fn is_node_tag(tag: &str) -> bool {
     matches!(
         tag,
-        b"Integer"
-            | b"IntReg"
-            | b"MaskedIntReg"
-            | b"IntSwissKnife"
-            | b"SwissKnife"
-            | b"Float"
-            | b"FloatReg"
-            | b"Enumeration"
-            | b"Boolean"
-            | b"Command"
-            | b"Category"
-            | b"Converter"
-            | b"IntConverter"
-            | b"Register"
-            | b"StringReg"
-            | b"String"
-            | b"StructReg"
+        "Integer"
+            | "IntReg"
+            | "MaskedIntReg"
+            | "IntSwissKnife"
+            | "SwissKnife"
+            | "Float"
+            | "FloatReg"
+            | "Enumeration"
+            | "Boolean"
+            | "Command"
+            | "Category"
+            | "Converter"
+            | "IntConverter"
+            | "Register"
+            | "StringReg"
+            | "String"
+            | "StructReg"
     )
 }
 
@@ -905,11 +925,11 @@ fn is_node_tag(tag: &[u8]) -> bool {
 /// `skip_element` and vanished — no log line, no [`XmlModel::skipped`] entry,
 /// nothing for a corpus test to trip over. `<Register>`, 56 declarations
 /// across 14 corpus documents, disappeared exactly this way.
-fn unknown_node(tag: &[u8], start: &BytesStart<'_>) -> Result<Option<SkippedNode>, XmlError> {
-    let Some(name) = attribute_value(start, b"Name")? else {
+fn unknown_node(tag: &str, start: &BytesStart<'_>) -> Result<Option<SkippedNode>, XmlError> {
+    let Some(name) = attribute_value(start, "Name")? else {
         return Ok(None);
     };
-    let tag = String::from_utf8_lossy(tag).into_owned();
+    let tag = tag.to_owned();
     tracing::warn!(
         tag = %tag,
         node = %name,
@@ -928,25 +948,22 @@ fn parse_node(
     reader: &mut Reader<&[u8]>,
     start: BytesStart<'_>,
 ) -> Result<Vec<NodeDecl>, XmlError> {
-    let tag = start.name().as_ref().to_vec();
-    let node = match tag.as_slice() {
-        b"Integer" | b"IntReg" | b"MaskedIntReg" => parse_integer(reader, start)?,
-        b"IntSwissKnife" | b"SwissKnife" => parse_swissknife(reader, start)?,
-        b"Float" | b"FloatReg" => parse_float(reader, start)?,
-        b"Enumeration" => parse_enum(reader, start)?,
-        b"Boolean" => parse_boolean(reader, start)?,
-        b"Command" => parse_command(reader, start)?,
-        b"Category" => parse_category(reader, start)?,
-        b"Converter" => parse_converter(reader, start)?,
-        b"IntConverter" => parse_int_converter(reader, start)?,
-        b"Register" => parse_register(reader, start)?,
-        b"StringReg" | b"String" => parse_string(reader, start)?,
-        b"StructReg" => return parse_struct_reg(reader, start),
+    let tag = start.name().as_ref().to_string();
+    let node = match tag.as_str() {
+        "Integer" | "IntReg" | "MaskedIntReg" => parse_integer(reader, start)?,
+        "IntSwissKnife" | "SwissKnife" => parse_swissknife(reader, start)?,
+        "Float" | "FloatReg" => parse_float(reader, start)?,
+        "Enumeration" => parse_enum(reader, start)?,
+        "Boolean" => parse_boolean(reader, start)?,
+        "Command" => parse_command(reader, start)?,
+        "Category" => parse_category(reader, start)?,
+        "Converter" => parse_converter(reader, start)?,
+        "IntConverter" => parse_int_converter(reader, start)?,
+        "Register" => parse_register(reader, start)?,
+        "StringReg" | "String" => parse_string(reader, start)?,
+        "StructReg" => return parse_struct_reg(reader, start),
         other => {
-            return Err(XmlError::Invalid(format!(
-                "not a node element: {}",
-                String::from_utf8_lossy(other)
-            )));
+            return Err(XmlError::Invalid(format!("not a node element: {other}")));
         }
     };
     Ok(vec![node])
@@ -989,6 +1006,7 @@ fn parse_isolated_node(element: &str) -> Result<Vec<NodeDecl>, XmlError> {
 /// rather than failing the load and leaving the camera unopenable. Only errors
 /// that make the document as a whole unreadable are returned.
 pub fn parse(xml: &str) -> Result<XmlModel, XmlError> {
+    let xml = strip_bom(xml);
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
     // Vendor XML is not ours to fix: a lone `&` in a tooltip must not stop us
@@ -1005,30 +1023,43 @@ pub fn parse(xml: &str) -> Result<XmlModel, XmlError> {
         let element_start = reader.buffer_position() as usize;
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) => match e.name().as_ref() {
-                b"RegisterDescription" => {
+                "RegisterDescription" => {
                     version = schema_version_from(e)?;
                 }
-                b"Group" => {
+                "Group" => {
                     // Group is a transparent container wrapping feature nodes;
                     // let child events surface in the next loop iterations.
                 }
-                b"Port" => {
+                "Port" => {
                     // Port nodes are transport-level abstractions; skip them.
                     skip_element(&mut reader, e.name().as_ref())?;
                 }
                 tag if is_node_tag(tag) => {
-                    let tag = tag.to_vec();
-                    let name = attribute_value(e, b"Name")?;
+                    let tag = tag.to_owned();
+                    let name = attribute_value(e, "Name")?;
                     // Consume the element up front: whatever the node parser
                     // makes of it, the document reader stays in step.
                     reader
                         .read_to_end(QName(&tag))
                         .map_err(|err| XmlError::Xml(err.to_string()))?;
-                    let element = &xml[element_start..reader.buffer_position() as usize];
-                    match parse_isolated_node(element) {
+                    // `get`, not `[..]`: this slice is built from reader
+                    // offsets rather than from `xml` itself, and a byte-order
+                    // mark used to desynchronise the two (#122). Indexing
+                    // panics on a non-character-boundary index; `get` turns the
+                    // same disagreement into one skipped feature, which is the
+                    // right price to pay in the middle of a camera connect.
+                    let element = xml
+                        .get(element_start..reader.buffer_position() as usize)
+                        .ok_or_else(|| {
+                            XmlError::Invalid(format!(
+                                "reader offset {element_start}..{} is not a character \
+                                 boundary in the document",
+                                reader.buffer_position()
+                            ))
+                        });
+                    match element.and_then(parse_isolated_node) {
                         Ok(parsed) => nodes.extend(parsed),
                         Err(err) => {
-                            let tag = String::from_utf8_lossy(&tag).into_owned();
                             tracing::warn!(
                                 tag = %tag,
                                 node = name.as_deref().unwrap_or("<unnamed>"),
@@ -1052,20 +1083,20 @@ pub fn parse(xml: &str) -> Result<XmlModel, XmlError> {
                 }
             },
             Ok(Event::Empty(ref e)) => match e.name().as_ref() {
-                b"RegisterDescription" => {
+                "RegisterDescription" => {
                     version = schema_version_from(e)?;
                 }
-                b"Command" => {
+                "Command" => {
                     let node = parse_command_empty(e)?;
                     nodes.push(node);
                 }
-                b"Category" => {
+                "Category" => {
                     let node = parse_category_empty(e)?;
                     nodes.push(node);
                 }
                 // Same transport-level abstraction the Start arm skips; four
                 // corpus documents declare it as `<Port Name="Device"/>`.
-                b"Port" => {}
+                "Port" => {}
                 tag => {
                     if let Some(record) = unknown_node(tag, e)? {
                         skipped.push(record);
@@ -1095,9 +1126,9 @@ pub fn parse(xml: &str) -> Result<XmlModel, XmlError> {
 }
 
 fn schema_version_from(event: &BytesStart<'_>) -> Result<String, XmlError> {
-    let major = attribute_value(event, b"SchemaMajorVersion")?;
-    let minor = attribute_value(event, b"SchemaMinorVersion")?;
-    let sub = attribute_value(event, b"SchemaSubMinorVersion")?;
+    let major = attribute_value(event, "SchemaMajorVersion")?;
+    let minor = attribute_value(event, "SchemaMinorVersion")?;
+    let sub = attribute_value(event, "SchemaSubMinorVersion")?;
     let major = major.unwrap_or_else(|| "0".to_string());
     let minor = minor.unwrap_or_else(|| "0".to_string());
     let sub = sub.unwrap_or_else(|| "0".to_string());
@@ -1113,19 +1144,19 @@ fn handle_start(
     if depth == 1 && schema_version.is_none() {
         *schema_version = extract_schema_version(event);
     } else if depth == 2 {
-        if let Some(name) = attribute_value(event, b"Name")? {
+        if let Some(name) = attribute_value(event, "Name")? {
             top_level.push(name);
         } else {
-            top_level.push(String::from_utf8_lossy(event.name().as_ref()).to_string());
+            top_level.push(event.name().as_ref().to_string());
         }
     }
     Ok(())
 }
 
 fn extract_schema_version(event: &BytesStart<'_>) -> Option<String> {
-    let major = attribute_value(event, b"SchemaMajorVersion").ok().flatten();
-    let minor = attribute_value(event, b"SchemaMinorVersion").ok().flatten();
-    let sub = attribute_value(event, b"SchemaSubMinorVersion")
+    let major = attribute_value(event, "SchemaMajorVersion").ok().flatten();
+    let minor = attribute_value(event, "SchemaMinorVersion").ok().flatten();
+    let sub = attribute_value(event, "SchemaSubMinorVersion")
         .ok()
         .flatten();
     if major.is_none() && minor.is_none() && sub.is_none() {
@@ -1599,19 +1630,32 @@ mod tests {
         }
     }
 
+    /// Big-endian `<LSB>`/`<MSB>` are counted **from the MSB**, so a
+    /// conformant document has `<LSB>` >= `<MSB>` and the pair's *minimum* is
+    /// the offset of the field's most significant bit.
+    ///
+    /// The fixture is real: `AVT_Manta_G125B.xml` declares GigE Vision's
+    /// bootstrap `GevSCPSPacketSize` at `0xD04` exactly this way, and the
+    /// standard fixes that register's layout — the packet size is the *low*
+    /// 16 bits. `viva_genapi::bitops` turns `bit_offset = 16` over 4 bytes into
+    /// `shift = 32 - 16 - 16 = 0`, i.e. the low half. The end-to-end decode is
+    /// asserted in `viva-genapi`, which owns the extraction.
+    ///
+    /// This test previously used `<Lsb>8</Lsb><Msb>15</Msb>` with `BigEndian` —
+    /// a shape that appears **zero** times in the 38-document vendor corpus and
+    /// is inverted against its own byte order. It encoded the issue-#120 defect
+    /// rather than catching it.
     #[test]
     fn parse_integer_bitfield_big_endian() {
         const XML: &str = r#"
             <RegisterDescription SchemaMajorVersion="1" SchemaMinorVersion="0" SchemaSubMinorVersion="0">
-                <Integer Name="Packed">
-                    <Address>0x1000</Address>
+                <Integer Name="RegSCPSPacketSize">
+                    <Address>0xD04</Address>
                     <Length>4</Length>
                     <AccessMode>RW</AccessMode>
-                    <Min>0</Min>
-                    <Max>65535</Max>
-                    <Lsb>8</Lsb>
-                    <Msb>15</Msb>
-                    <Endianness>BigEndian</Endianness>
+                    <LSB>31</LSB>
+                    <MSB>16</MSB>
+                    <Endianess>BigEndian</Endianess>
                 </Integer>
             </RegisterDescription>
         "#;
@@ -1623,13 +1667,154 @@ mod tests {
                 assert_eq!(*len, 4);
                 let field = bitfield.as_ref().expect("bitfield present");
                 assert_eq!(field.byte_order, ByteOrder::Big);
-                assert_eq!(field.bit_length, 8);
+                assert_eq!(field.bit_length, 16);
                 assert_eq!(field.bit_offset, 16);
             }
             other => panic!("unexpected node: {other:?}"),
         }
     }
 
+    /// `<Bit>` is `<LSB>` and `<MSB>` at the same index, so it inherits the same
+    /// orientation: on a big-endian register `<Bit>0</Bit>` is the *most*
+    /// significant bit.
+    ///
+    /// This is the exact shape behind issue #120 — FLIR gates `ExposureTime` on
+    /// three such registers sharing one 32-bit word at `0x000C1000`.
+    #[test]
+    fn parse_big_endian_single_bit_is_counted_from_the_msb() {
+        const XML: &str = r#"
+            <RegisterDescription SchemaMajorVersion="1" SchemaMinorVersion="0" SchemaSubMinorVersion="0">
+                <Integer Name="ExposureTime_Imp">
+                    <Address>0x000C1000</Address>
+                    <Length>4</Length>
+                    <AccessMode>RO</AccessMode>
+                    <Bit>0</Bit>
+                    <Endianess>BigEndian</Endianess>
+                </Integer>
+            </RegisterDescription>
+        "#;
+
+        let model = parse(XML).expect("parse big-endian single bit");
+        match &model.nodes[0] {
+            NodeDecl::Integer { bitfield, .. } => {
+                let field = bitfield.as_ref().expect("bitfield present");
+                assert_eq!(field.bit_length, 1);
+                // Offset from the MSB, so `bitops` shifts by 31 and reads the
+                // top bit. Before #120 this was 31, which shifted by 0.
+                assert_eq!(field.bit_offset, 0);
+            }
+            other => panic!("unexpected node: {other:?}"),
+        }
+    }
+
+    /// The GenICam schema spells the bit-range elements `LSB` and `MSB`, and
+    /// every one of the 1 419 declarations inside register nodes across the
+    /// vendor corpus uses that spelling — none uses `Lsb`.
+    ///
+    /// `parsers::numeric` matched only the mixed-case form, so it dropped the
+    /// bit range from every `<MaskedIntReg>` in every real document and read the
+    /// whole register instead. `parsers::struct_reg` already accepted both,
+    /// which is another way the two bitfield paths had drifted apart. Both
+    /// spellings must parse, and to the same field.
+    #[test]
+    fn both_spellings_of_lsb_and_msb_are_accepted() {
+        fn bitfield_of(lsb_tag: &str, msb_tag: &str) -> BitField {
+            let xml = format!(
+                r#"<RegisterDescription SchemaMajorVersion="1" SchemaMinorVersion="1" SchemaSubMinorVersion="1">
+                     <MaskedIntReg Name="Field">
+                       <Address>0xD04</Address><Length>4</Length><AccessMode>RW</AccessMode>
+                       <{lsb_tag}>31</{lsb_tag}><{msb_tag}>16</{msb_tag}>
+                       <Endianess>BigEndian</Endianess>
+                     </MaskedIntReg>
+                   </RegisterDescription>"#
+            );
+            let model = parse(&xml).expect("parse");
+            match &model.nodes[0] {
+                NodeDecl::Integer { bitfield, .. } => *bitfield.as_ref().expect("bitfield present"),
+                other => panic!("unexpected node: {other:?}"),
+            }
+        }
+
+        let schema = bitfield_of("LSB", "MSB");
+        let mixed = bitfield_of("Lsb", "Msb");
+        assert_eq!(schema.bit_offset, 16);
+        assert_eq!(schema.bit_length, 16);
+        assert_eq!(schema, mixed);
+    }
+
+    /// Both spellings must reach the `<Boolean>` parser too, not only the
+    /// numeric one.
+    ///
+    /// `<Boolean>` is parsed by `parsers::symbolic`, a different function from
+    /// the `<Integer>`/`<MaskedIntReg>` path, and it matched the shared
+    /// `TAG_LSB`/`TAG_MSB` constants. Renaming those to the schema spelling for
+    /// GA-22 therefore *swapped* which spelling worked here instead of
+    /// accepting both — and a register-backed Boolean wider than one byte whose
+    /// bit range is dropped is not merely misread, it fails
+    /// `Boolean node {name} requires explicit bitfield metadata` and is skipped
+    /// outright. Caught in review on
+    /// [#124](https://github.com/VitalyVorobyev/viva-genicam/pull/124).
+    #[test]
+    fn boolean_accepts_both_spellings_of_lsb_and_msb() {
+        fn flag_bitfield(lsb_tag: &str, msb_tag: &str) -> BitField {
+            let xml = format!(
+                r#"<RegisterDescription SchemaMajorVersion="1" SchemaMinorVersion="1" SchemaSubMinorVersion="1">
+                     <Boolean Name="Flag">
+                       <Address>0x2000</Address><Length>4</Length><AccessMode>RW</AccessMode>
+                       <{lsb_tag}>31</{lsb_tag}><{msb_tag}>31</{msb_tag}>
+                       <Endianess>BigEndian</Endianess>
+                     </Boolean>
+                   </RegisterDescription>"#
+            );
+            let model = parse(&xml).expect("parse");
+            assert!(model.skipped.is_empty(), "skipped: {:?}", model.skipped);
+            match &model.nodes[0] {
+                NodeDecl::Boolean { bitfield, .. } => *bitfield.as_ref().expect("bitfield present"),
+                other => panic!("unexpected node: {other:?}"),
+            }
+        }
+
+        let schema = flag_bitfield("LSB", "MSB");
+        let mixed = flag_bitfield("Lsb", "Msb");
+        // Index 31 from the MSB of a 4-byte register is the least significant
+        // bit, so `bitops` shifts by zero.
+        assert_eq!(schema.bit_offset, 31);
+        assert_eq!(schema.bit_length, 1);
+        assert_eq!(schema, mixed);
+    }
+
+    /// `<Mask>` is the one bitfield source that stays LSB-relative under `Big`,
+    /// because it is a literal register value rather than a GenICam bit index.
+    ///
+    /// It has zero corpus occurrences, so only this test keeps the distinction
+    /// honest: the #120 fix removes the endianness conversion for `<LSB>`/
+    /// `<MSB>`/`<Bit>` and must **keep** it here.
+    #[test]
+    fn big_endian_mask_stays_lsb_relative() {
+        const XML: &str = r#"
+            <RegisterDescription SchemaMajorVersion="1" SchemaMinorVersion="0" SchemaSubMinorVersion="0">
+                <Integer Name="Masked">
+                    <Address>0x3000</Address>
+                    <Length>4</Length>
+                    <AccessMode>RW</AccessMode>
+                    <Mask>0x0000FF00</Mask>
+                    <Endianess>BigEndian</Endianess>
+                </Integer>
+            </RegisterDescription>
+        "#;
+
+        let model = parse(XML).expect("parse big-endian mask");
+        match &model.nodes[0] {
+            NodeDecl::Integer { bitfield, .. } => {
+                let field = bitfield.as_ref().expect("bitfield present");
+                assert_eq!(field.byte_order, ByteOrder::Big);
+                assert_eq!(field.bit_length, 8);
+                // Bits 8..15 counted from the LSB are bits 16..23 from the MSB.
+                assert_eq!(field.bit_offset, 16);
+            }
+            other => panic!("unexpected node: {other:?}"),
+        }
+    }
     #[test]
     fn parse_boolean_bitfield_default_length() {
         const XML: &str = r#"
@@ -1652,6 +1837,99 @@ mod tests {
                 assert_eq!(bf.byte_order, ByteOrder::Little);
                 assert_eq!(bf.bit_length, 1);
                 assert_eq!(bf.bit_offset, 3);
+            }
+            other => panic!("unexpected node: {other:?}"),
+        }
+    }
+
+    /// GA-28: `<Endianess>` on a plain `<IntReg>` used to go only into the
+    /// bitfield builder, which discards it when nothing sets a bit range — so
+    /// 311 declarations across 16 of the 38 corpus documents decoded
+    /// byte-swapped. All three spellings the parser accepts are checked,
+    /// because vendors use all three.
+    #[test]
+    fn plain_integer_records_its_declared_byte_order() {
+        for tag in ["Endianess", "Endianness", "ByteOrder"] {
+            let xml = format!(
+                r#"
+            <RegisterDescription SchemaMajorVersion="1" SchemaMinorVersion="0" SchemaSubMinorVersion="0">
+                <IntReg Name="Reg">
+                    <Address>0x3000</Address>
+                    <Length>4</Length>
+                    <AccessMode>RO</AccessMode>
+                    <{tag}>LittleEndian</{tag}>
+                </IntReg>
+            </RegisterDescription>
+        "#
+            );
+
+            let model = parse(&xml).unwrap_or_else(|err| panic!("parse <{tag}>: {err}"));
+            match &model.nodes[0] {
+                NodeDecl::Integer {
+                    byte_order,
+                    bitfield,
+                    ..
+                } => {
+                    assert_eq!(*byte_order, ByteOrder::Little, "<{tag}>");
+                    // No <LSB>/<MSB>/<Bit>/<Mask>, so there is no bitfield to
+                    // have carried the order — which is the whole defect.
+                    assert!(bitfield.is_none(), "<{tag}>");
+                }
+                other => panic!("unexpected node: {other:?}"),
+            }
+        }
+    }
+
+    /// GenICam's default is big-endian, and a document that says nothing must
+    /// keep getting it.
+    #[test]
+    fn plain_integer_without_endianness_defaults_to_big() {
+        const XML: &str = r#"
+            <RegisterDescription SchemaMajorVersion="1" SchemaMinorVersion="0" SchemaSubMinorVersion="0">
+                <IntReg Name="Reg">
+                    <Address>0x3000</Address>
+                    <Length>4</Length>
+                    <AccessMode>RO</AccessMode>
+                </IntReg>
+            </RegisterDescription>
+        "#;
+
+        let model = parse(XML).expect("parse");
+        match &model.nodes[0] {
+            NodeDecl::Integer { byte_order, .. } => assert_eq!(*byte_order, ByteOrder::Big),
+            other => panic!("unexpected node: {other:?}"),
+        }
+    }
+
+    /// Negative control. A masked register takes the bitfield path, which
+    /// already handled byte order and must keep doing so — the decl field is
+    /// recorded but not consulted. Asserting both stops a later refactor
+    /// quietly routing masked registers through the new path.
+    #[test]
+    fn masked_integer_keeps_the_bitfield_byte_order_path() {
+        const XML: &str = r#"
+            <RegisterDescription SchemaMajorVersion="1" SchemaMinorVersion="0" SchemaSubMinorVersion="0">
+                <IntReg Name="Reg">
+                    <Address>0x3000</Address>
+                    <Length>4</Length>
+                    <AccessMode>RO</AccessMode>
+                    <Endianess>LittleEndian</Endianess>
+                    <LSB>15</LSB>
+                    <MSB>0</MSB>
+                </IntReg>
+            </RegisterDescription>
+        "#;
+
+        let model = parse(XML).expect("parse");
+        match &model.nodes[0] {
+            NodeDecl::Integer {
+                byte_order,
+                bitfield,
+                ..
+            } => {
+                assert_eq!(*byte_order, ByteOrder::Little);
+                let field = bitfield.as_ref().expect("bitfield present");
+                assert_eq!(field.byte_order, ByteOrder::Little);
             }
             other => panic!("unexpected node: {other:?}"),
         }
@@ -1790,6 +2068,71 @@ mod tests {
             NodeDecl::Integer { meta, .. } => meta,
             other => panic!("unexpected node: {other:?}"),
         }
+    }
+
+    /// Regression for issue #122: The Imaging Source's DMK 33GP2000e ships its
+    /// GenApi XML with a UTF-8 byte-order mark.
+    ///
+    /// The BOM is valid UTF-8, so nothing upstream rejected it and `parse`
+    /// returned `Ok` — with every node in the document skipped, because
+    /// quick-xml strips the BOM from its own view without advancing
+    /// `buffer_position`, leaving each sliced element three bytes short of its
+    /// closing `>`. Assert the node count *and* an empty skip list: asserting
+    /// `parse(..).is_ok()` alone passed throughout the bug.
+    #[test]
+    fn byte_order_mark_does_not_shift_node_slices() {
+        let body = r#"<Integer Name="Width"><Address>0x100</Address><Length>4</Length></Integer><Integer Name="Height"><Address>0x104</Address><Length>4</Length></Integer>"#;
+        let doc = format!(
+            r#"<RegisterDescription SchemaMajorVersion="1" SchemaMinorVersion="1" SchemaSubMinorVersion="1">{body}</RegisterDescription>"#
+        );
+        let with_bom = format!("\u{feff}{doc}");
+
+        let plain = parse(&doc).expect("parse without BOM");
+        let bom = parse(&with_bom).expect("parse with BOM");
+
+        assert!(
+            bom.skipped.is_empty(),
+            "BOM document skipped nodes: {:?}",
+            bom.skipped
+        );
+        assert_eq!(bom.nodes.len(), plain.nodes.len());
+        assert_eq!(bom.version, plain.version);
+    }
+
+    /// The same document, through the offset-free scan `viva-camctl` and the
+    /// `fetch_xml` example use first. This half always worked — which is why
+    /// issue #122 reported 291 top-level features listed correctly and then
+    /// every node failing. Pin it so the two entry points cannot diverge again.
+    #[test]
+    fn byte_order_mark_does_not_disturb_the_minimal_scan() {
+        let doc = r#"<RegisterDescription SchemaMajorVersion="1" SchemaMinorVersion="1" SchemaSubMinorVersion="1"><Category Name="Root"><pFeature>Width</pFeature></Category></RegisterDescription>"#;
+        let with_bom = format!("\u{feff}{doc}");
+
+        let info = parse_into_minimal_nodes(&with_bom).expect("minimal scan with BOM");
+        assert_eq!(info.schema_version.as_deref(), Some("1.1.1"));
+        assert_eq!(info.top_level_features, vec!["Root".to_string()]);
+    }
+
+    /// A BOM in a document that also carries multi-byte text.
+    ///
+    /// The three-byte shift lands on ASCII markup for any XML we have seen, so
+    /// this is not a second failure mode — it is the same one, checked on
+    /// content where a wrong slice would corrupt text rather than only truncate
+    /// a tag. The `xml.get(..)` guard in [`parse`] is defensive on top of that:
+    /// no document in the corpus reaches a non-character-boundary index, and it
+    /// exists so that if one ever does the cost is one skipped feature instead
+    /// of a panic in the middle of a camera connect.
+    #[test]
+    fn byte_order_mark_before_multibyte_text_keeps_the_text_intact() {
+        let doc = r#"<RegisterDescription SchemaMajorVersion="1" SchemaMinorVersion="1" SchemaSubMinorVersion="1"><Integer Name="Gain"><Address>0x100</Address><Length>4</Length><ToolTip>Verstärkung in dB — Meßwert</ToolTip></Integer></RegisterDescription>"#;
+        let with_bom = format!("\u{feff}{doc}");
+
+        let model = parse(&with_bom).expect("parse with BOM and multi-byte text");
+        assert!(model.skipped.is_empty(), "skipped: {:?}", model.skipped);
+        assert_eq!(
+            only_meta(&model).tooltip.as_deref(),
+            Some("Verstärkung in dB — Meßwert")
+        );
     }
 
     /// Regression for issue #45: a FLIR BFS-PGE camera failed to open because a

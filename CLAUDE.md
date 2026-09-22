@@ -118,7 +118,7 @@ RUST_LOG=debug cargo test --workspace -- --nocapture
 Fake cameras only exercise constructs we already thought of. Real vendor
 GenApi XML is where the surprises live -- issues #45 and #35 were both a
 single vendor construct making a camera unopenable, and both reached
-users before us. The corpus test parses 37 documents: 34 real device
+users before us. The corpus test parses 38 documents: 35 real device
 descriptions (AVT, Basler, Baumer, FLIR, Hikrobot, JAI, Micro-Epsilon,
 PCO, Point Grey, Photonic Science, Prosilica, SVS, Sony, TIS), the
 GenICam conformance document, and aravis's two synthetic devices.
@@ -126,9 +126,11 @@ Count them with `ls fixtures/vendor-xml/*.xml | wc -l` rather than
 trusting this paragraph — it has drifted before, and three files here
 are not vendor hardware. Most are fetched from third-party projects; the
 Hikrobot MV-CS050-10GC (#35), five FLIR Blackfly / Blackfly S
-descriptions (#45) and the Micro-Epsilon scanCONTROL 850050 (#93) were
-contributed by users and are fetched from the issue attachments or a
-pinned gist revision. The fifth FLIR document is the #45 reporter's
+descriptions (#45), the Micro-Epsilon scanCONTROL 850050 (#93) and the
+TIS DMK 33GP2000e (#122) were contributed by users and are fetched from
+the issue attachments or a pinned gist revision. The DMK is the only
+document in the corpus that opens with a UTF-8 byte-order mark, which is
+the defect it was reported for. The fifth FLIR document is the #45 reporter's
 own BFS-PGE-31S4C-C, obtained with `viva-camctl xml` after 0.3.0 fixed
 the defect that made it unopenable — so that exact model is now covered
 directly rather than by four stand-ins.
@@ -275,11 +277,13 @@ cargo run -p viva-camctl -- list --iface 127.0.0.1
 # E2E with studio — GigE (3 terminals)
 # T1: cargo run -p viva-fake-gige
 # T2: cargo run -p viva-service -- --iface lo0 --zenoh-config studio/config/zenoh-local.json5
-# T3: cd studio/apps/viva-studio-tauri && cargo tauri dev
+# T3: export ZENOH_CONFIG=$(pwd)/studio/config/zenoh-studio.json5
+#     cd studio/apps/viva-studio-tauri && cargo tauri dev
 
 # E2E with studio — USB3 Vision fake camera (2 terminals)
 # T1: cargo run -p viva-service-u3v -- --fake --zenoh-config studio/config/zenoh-local.json5
-# T2: cd studio/apps/viva-studio-tauri && cargo tauri dev
+# T2: export ZENOH_CONFIG=$(pwd)/studio/config/zenoh-studio.json5
+#     cd studio/apps/viva-studio-tauri && cargo tauri dev
 ```
 
 ```bash
@@ -292,7 +296,20 @@ cargo run -p viva-camctl -- list --iface 127.0.0.1
 # T2: cargo run -p viva-camctl -- set-ip --mac DE:AD:BE:EF:CA:FE --ip 192.168.1.100 --iface 127.0.0.1
 ```
 
-**Important**: The `--zenoh-config` flag pointing to `zenoh-local.json5` is required on the **service** side (both GigE and U3V) when connecting to Viva Studio. The studio loads its own Zenoh config automatically in dev mode (`cargo tauri dev`).
+**Important**: both sides need their own Zenoh config, and neither is
+automatic. The **service** takes `--zenoh-config studio/config/zenoh-local.json5`
+(GigE and U3V alike). The **studio** reads the `ZENOH_CONFIG` environment
+variable — there is no default path, no dev-mode auto-detection, and no
+`--zenoh-config` flag on that binary. Point it at `zenoh-studio.json5` with an
+absolute path, because the walkthrough `cd`s into the app directory first.
+
+This file used to claim the studio "loads its own Zenoh config automatically in
+dev mode". It never did. Without `ZENOH_CONFIG` the app starts in *embedded*
+mode, whose GigE discovery deliberately skips loopback (`backend/embedded.rs`,
+guarding against #57) — so the fake camera is not merely slow to appear, it can
+never appear, and the device list stays empty with no error. That is #132. The
+app now shows its mode in the header and reports an unloadable `ZENOH_CONFIG`
+as an error instead of silently falling back.
 
 ## Documentation
 

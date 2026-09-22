@@ -7,7 +7,251 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **An eight-byte register declared `<Sign>Unsigned</Sign>` could not be read at
+  all** once its top bit was set — `node <name> holds an unsigned 64-bit value
+  larger than i64::MAX`. Reported on two vendors' cameras by two people: a
+  Vieworks FS3200T ([#112](https://github.com/VitalyVorobyev/viva-genicam/issues/112),
+  62 failing timestamp reads in an attached log) and a FLIR Blackfly
+  ([#140](https://github.com/VitalyVorobyev/viva-genicam/issues/140), a PTP
+  offset failing whenever it went negative). The value is now reinterpreted as
+  two's complement instead of refused, which is lossless at the bit level and
+  round-trips through the encoder. GenApi's `IInteger` *is* an `int64` (GenICam
+  v2.1.1 §2.4), so there is nowhere else to put it; see
+  [ADR-0022](docs/adrs/adr0022-integer-register-decoding.md) for why this
+  knowingly accepts XML the specification says cannot exist. The vendor corpus
+  holds **196 such registers across 22 of its 38 documents**, overwhelmingly
+  `*Timestamp*` and `Chunk*`. Neither reporter has confirmed the fix on their own
+  hardware yet.
+
+- **A plain `<IntReg>` declaring `<Endianess>LittleEndian</Endianess>` was
+  decoded big-endian anyway.** `NodeDecl::Integer` had no field for byte order,
+  and the parser routed the element only into the bitfield builder — which
+  discards it when no `<LSB>`, `<MSB>`, `<Bit>` or `<Mask>` creates a bitfield.
+  So on an *unmasked* register the declared order went nowhere. **311
+  declarations across 16 of the 38 corpus documents** are of that shape,
+  concentrated in Point Grey, FLIR, Basler, Hikrobot and Micro-Epsilon. Masked
+  registers were never affected.
+
+  **This was not reported; it was found while tracing the register above**, and
+  it changes reads *and* writes. `i64_to_bytes` had the same defect and validates
+  by round-tripping through the reader, so fixing one side alone would have
+  turned every little-endian write into a range error.
+
+- **Read this before upgrading.** Two consequences worth knowing about. A `u64`
+  register above `i64::MAX` — a PTP timestamp, typically — now reads as a large
+  negative number rather than an error; cast back with `as u64` if you want the
+  unsigned value. And because the byte-order fix moves reads and writes together,
+  an application that worked around the old behaviour on **one** side only will
+  now be self-inconsistent, while one that worked around both stays correct.
+
+- **The corpus test could not have caught either of them, and now can catch the
+  first.** Its `viva-genapi` stage evaluated every node against `NullIo`, which
+  answers reads with zeros — a byte swap of zero is still zero, and an unsigned
+  value's top bit is never set, so the weekly `Vendor XML Corpus` workflow passed
+  on 2026-08-31, 09-07 and 09-14 across a union of 448 wrong nodes. Each document
+  is now evaluated **twice**: once against `NullIo` and once against a test-local
+  stub returning a descending byte pattern that sets the top bit in either byte
+  order, where a conversion error counts as an engine defect. That second pass
+  fails on **373 nodes across 19 of the 38 documents** before this change and is
+  clean after. It still asserts no *values*, so a wrong-but-plausible number
+  would pass it; that is the rest of backlog `GA-11`.
+
+- **`cargo deny` was failing on `main`, and it was not the fault of the pull
+  request whose CI reported it.** A refresh of `Cargo.lock` — 153 packages,
+  `zenoh` 1.9.0 → 1.10.1 — clears two findings that had appeared since the last
+  lockfile touch: **RUSTSEC-2026-0285**, a rustls vulnerability where TLS 1.3
+  handshake messages packed into the same record as a key-changing message were
+  accepted at the wrong encryption level (fixed in rustls 0.23.45), and a yanked
+  `chacha20` 0.10.1. Both arrive through zenoh's QUIC link, so no code here is
+  affected, but `cargo deny check` is a hard gate and the whole repository was
+  red on it — including [#139](https://github.com/VitalyVorobyev/viva-genicam/pull/139),
+  where it looked like a contributor's failure.
+
+  The four advisories `deny.toml` accepts were **re-derived rather than carried
+  forward**: emptied, re-run, and kept only where they still fire. All four still
+  do, all four are still zenoh transitive dependencies (`lz4_flex`, `rsa`,
+  `paste`, `rustls-pemfile`), and the comment now says so against 1.10.1 instead
+  of 1.9.0. The procedure is written into `deny.toml`, because an exception list
+  is only defensible against the lock that actually ships.
+
 ### Changed
+
+- **`quick-xml` 0.41 → 0.42, which moves the parser from bytes to `&str`**
+  (backlog `CI-14`). 0.42 rewrites the API around `&str`: `QName` and the text
+  event types wrap it, `AsRef<[u8]>` is gone, and `BytesText`/`BytesCData`/
+  `BytesRef` deref to `str` rather than needing a fallible `.decode()`. Our XML
+  layer matched element names against byte-string literals throughout, so this
+  touched all ten files of `viva-genapi-xml`: 21 tag constants and 222 literals
+  become `&str`, four helper signatures follow (`attribute_value`,
+  `attribute_value_required`, `skip_element`, `read_text_events`), and the
+  per-element `node_name` snapshot becomes a `String` instead of a `Vec<u8>`.
+
+  It is a net **deletion** — 284 lines added against 317 removed — because the
+  decode error paths and the `String::from_utf8_lossy` calls that existed only to
+  turn an element name back into something printable are gone with it. quick-xml
+  0.42's MSRV is 1.86, below our 1.88, so nothing moves there.
+
+  **The gate for a refactor this wide is that nothing changes**, and that is what
+  the vendor corpus is for: 38 documents, 35 407 nodes, 11 382 bitfields, with
+  per-document node and bitfield counts and known-gap lists **diffed against 0.41
+  and byte-identical**. Worth stating plainly that this is not a bug fix and
+  brings no behaviour change; it was done for the simplification.
+
+- **`zip` 2 → 8, and declared once instead of three times.** It was pinned six
+  majors back and repeated independently in `viva-genapi-xml` (behind the `fetch`
+  feature), `viva-u3v` and `viva-fake-gige` — three copies of a dependency that
+  is on the connect path of both transports, because GenICam XML is frequently
+  served as a ZIP archive by the camera itself. It is now a single
+  `[workspace.dependencies]` entry that all three inherit. No source change was
+  needed: the API surface used (`ZipArchive`, `ZipWriter`, `SimpleFileOptions`,
+  `CompressionMethod::Deflated`) is unchanged across those six majors, the
+  `deflate` feature still exists, and zip 8's MSRV of 1.88 is exactly ours.
+
+### Viva Studio and documentation — not part of any published crate
+
+Viva Studio lives in the `studio/` workspace, which is excluded from the root
+workspace and published nowhere: no crate on crates.io and no desktop binary
+carries these changes. They are recorded here because the book they correct
+*is* published on every push to `main`. Nothing in this section changes the
+library.
+
+- **The planning documents now only describe open work.** `docs/backlog.md` had
+  accumulated 69 completed rows, each carrying a post-mortem paragraph, and the
+  working list had reached 131 KB across 275 rows — about 60% of it a second,
+  worse changelog. Those rows are deleted; this file is the record of what
+  shipped. `docs/roadmap.md` opened with "This file only looks forward" and then
+  spent 110 of its 310 lines narrating two closed releases, so the closed phases
+  are gone and the file now names the release in flight and what gates it. The
+  remaining phases lost their *"Fixed (TC-xx)"* annotations for the same reason.
+
+  Two things were preserved rather than dropped on the way out. The lessons that
+  were about *how to file a row* rather than about any one defect are now in the
+  backlog's preamble — do not propose downgrading a log level before the
+  warning's cause is known, because that is a proposal to delete the evidence;
+  and a row filed from fake-camera output alone is a hypothesis. And the 16 open
+  rows that referenced a deleted one were rewritten to carry the fact instead of
+  the row ID, so the prune could not quietly turn into data loss.
+
+  Also corrected while in there: the `API` section was still titled "0.4.0
+  consolidation" two releases later, `API-03` still asked for a `thiserror` bump
+  that shipped in 0.5.0, and the `GA` section asserted a corpus denominator of 37
+  where the tree holds 38 — in a paragraph whose own subject is that these
+  numbers go stale. It now gives the command instead of a number.
+
+- **Three ADRs that had been reversed in fact are marked reversed in writing.**
+  [ADR-0003](docs/adrs/adr0003-gentl-transport.md) said the transport was GenTL
+  "exclusively" and was still marked `Accepted`, although GenTL appears nowhere
+  in `crates/` — [ADR-0011](docs/adrs/adr0011-pure-rust-genicam-stack.md)
+  replaced it. [ADR-0002](docs/adrs/adr0002-camera-service-architecture.md)
+  described the camera service as external and in a separate repository; it is
+  `crates/viva-service` here. [ADR-0001](docs/adrs/adr0001-desktop-primary.md)
+  named a WASM crate that was never carried into this repository. Each now
+  carries a "What changed" note, because a superseded decision is part of the
+  record and deleting it loses the reversal.
+
+- **`docs/studio/camera-service-api.md` and `studio/CHANGELOG.md` are deleted.**
+  The first specified the API of a GenTL-based service in another repository —
+  both premises retired. The second is the changelog of "GenICam Studio" before
+  the rename and the monorepo import, and every path it names
+  (`crates/genicam_xml_model`, `apps/genicam-ws-streamer`, …) is gone; nothing is
+  published from it and this file carries the Studio entries now. The seven
+  stale `docs/zenoh-api.md` / `docs/camera-service-api.md` links left over from
+  that move are fixed, and the gap that let them rot for weeks is filed as
+  `CI-17` — nothing checks links outside `book/`.
+
+- **Triage of seven open issues is recorded as backlog rows rather than prose.**
+  New: `GA-28` (a plain `<IntReg>` discards its declared byte order — 311
+  declarations in 16 of 38 corpus documents decode byte-swapped, found while
+  tracing [#140](https://github.com/VitalyVorobyev/viva-genicam/issues/140)), `GA-31`/`DX-11`/`SVC-08` ([#135](https://github.com/VitalyVorobyev/viva-genicam/issues/135)),
+  `TC-22`/`TC-23` ([#136](https://github.com/VitalyVorobyev/viva-genicam/issues/136)), `SVC-07`/`ST-24`/`ST-25`/`API-13`
+  ([#137](https://github.com/VitalyVorobyev/viva-genicam/issues/137)), `DC-05`/`GA-29` ([#138](https://github.com/VitalyVorobyev/viva-genicam/issues/138), [#139](https://github.com/VitalyVorobyev/viva-genicam/pull/139)), plus
+  `GA-30`, `CI-17` and `REL-08`. `GA-20` moves to **P0** with its open design
+  question closed — [#140](https://github.com/VitalyVorobyev/viva-genicam/issues/140) is the second vendor to report it and its
+  spec citation settles the representation — and `GA-11` moves to **P0** because
+  it is why neither defect was ever caught: the corpus test evaluates against
+  zeros, so it stayed green across a union of 448 wrong nodes.
+
+- **Viva Studio now shows which backend mode it started in, and says so when it
+  could not honour `ZENOH_CONFIG`** (backlog `DOC-18`/`ST-23`,
+  [#132](https://github.com/VitalyVorobyev/viva-genicam/issues/132)). Six
+  documents told readers that Studio "loads its own Zenoh config automatically
+  in dev mode". It never has: remote mode requires the `ZENOH_CONFIG`
+  environment variable to name a loadable config file — there is no default
+  path, no dev-mode detection, and no `--zenoh-config` flag on that binary.
+  Without it the app starts in embedded mode, whose GigE discovery deliberately
+  skips loopback, so the fake camera in the documented walkthrough could never
+  appear and the device list stayed empty with no error at all.
+
+  The walkthroughs now export `ZENOH_CONFIG`, absolute — they `cd` into the app
+  directory immediately after, which breaks a relative path. More to the point,
+  the app no longer hides the answer: the header carries an Embedded/Remote
+  chip, and a `ZENOH_CONFIG` that is set but fails to load is now an `error!`
+  plus an error toast and a Diagnostics entry, instead of a `warn!` and a silent
+  switch to the other mode. It still starts, so it is never unlaunchable.
+
+  Two things surfaced while fixing it. The cookbook's mock-service quick start
+  was broken the same way and is now verified end to end rather than assumed.
+  And the Tauri crate's 50 unit tests had never run in CI — it is excluded from
+  the studio workspace, so `cargo test --workspace` never reached it — which
+  `studio-ci.yml` now corrects.
+
+- **The `studio/` workspace now has a `[workspace.dependencies]` table, and its
+  crates are on edition 2024** (backlog `ST-01`). It had none, so five crates
+  declared their own versions and quietly drifted from the library workspace:
+  `thiserror` stayed on 1 after the root moved to 2, `axum` on 0.7,
+  `tokio-tungstenite` on 0.26, and `zenoh` was spelled `"1.8"` where the root says
+  `"1"`. All five are now on edition 2024 with inherited versions, `axum` 0.8,
+  `tokio-tungstenite` 0.30 and `thiserror` 2; the Tauri crate, which is its own
+  workspace, takes `dirs` 7.
+
+  Two things had to change in source. axum 0.8's `Message::Text` takes
+  `Utf8Bytes` and `Message::Binary` takes `Bytes` — which the frame channel
+  already carries, so passing it through **drops a full copy of every frame** that
+  the old `to_vec()` was making on each WebSocket send. And edition 2024 enables
+  let-chains, so `clippy::collapsible_if` now fires on nested `if let`; the 12
+  sites it found are mechanical and were collapsed.
+
+- **The Studio UI's 14 type errors are fixed, and CI now type-checks the
+  frontend** (backlog `ST-20`). `bun run build` is Vite, which strips types
+  without checking them, so nothing in CI had ever type-checked the UI;
+  `studio-ci.yml` now runs `bunx tsc --noEmit`. Seven of the fourteen were a
+  stale `uigraph.ts`: the Rust model has always carried `UiCategory::{tooltip,
+  comment}` and `UiNode::comment`, so the components reading them were correct
+  and the TypeScript declarations were the half that had drifted — the feature
+  tooltips were arriving all along. `formatDeviceChip` handled four of
+  `ConnectionState`'s five variants and returned `undefined` for
+  `reconnecting`; it now renders the attempt count, as `DeviceDropdown` already
+  did. The rest were unused declarations, including a fixture-loading
+  affordance that had been wired to nothing since the studio was imported.
+
+## [0.5.0] - 2026-08-26
+
+Two behaviour changes need a read before upgrading, both under the headings
+below: streaming no longer writes `GevSCPSPacketSize` unless you ask it to, and
+big-endian masked registers are now read from the MSB as GenICam specifies —
+which changes what `pIsAvailable`/`pIsLocked` evaluate to on most GigE cameras.
+Both fix defects reported from real hardware.
+
+### Changed
+
+- **Dependency majors brought current** (backlog `CI-13`): `thiserror` 1 → 2,
+  `if-addrs` 0.11 → 0.15, `socket2` 0.5 → 0.6, and `pyo3`/`numpy` 0.28 → 0.29
+  for the Python bindings. `if-addrs` was checked rather than assumed — its
+  `link-local` feature is what makes APIPA interfaces visible on Windows, and it
+  still exists at 0.15. `quick-xml` stays at 0.41 deliberately: 0.42 moves its
+  whole API from `&[u8]` to `&str` and is a refactor of every parser, tracked as
+  `CI-14`.
+
+- **The project status statements now match the evidence.** `README.md` said the
+  library was "barely tested against physical cameras — we have none". The
+  tracker says otherwise: users have run discovery, control and streaming
+  against real FLIR, Hikrobot and JAI cameras on Linux, Windows and macOS. The
+  three statements (root README, crate README, book) also carried three
+  different and all-stale test and corpus counts. They now say the same thing,
+  from the same numbers, and keep the caveat that actually matters — the API
+  moves, and there is no camera in CI.
 
 - **Breaking: streaming no longer overwrites the camera's `GevSCPSPacketSize` by
   default** (backlog `SR-14`, ADR-0021,
@@ -35,6 +279,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`Camera.execute(name)` in the Python bindings, and `viva-camctl execute`**
+  ([#121](https://github.com/VitalyVorobyev/viva-genicam/issues/121), backlog
+  `API-12`). GenApi `<Command>` features — `UserSetLoad`, `TimestampLatch`,
+  `TriggerSoftware` — had no verb in Python, so a user trying to reset a camera
+  through `UserSetSelector` + `UserSetLoad` concluded, reasonably, that it was
+  not possible.
+
+  It *was* possible: `Camera.set(name, "1")` dispatches Command nodes and
+  discards the value, and always has. Nothing said so, and a setter that
+  requires a meaningless value is not an API anyone should have to guess. The
+  Rust facade already had `Camera::execute_command`, and the service and Studio
+  already spoke `execute` on the wire; only Python and the CLI were missing it.
+  Both now use the same verb.
+
+  `viva-camctl execute --name <Node>` does not read back: `Camera::get` on a
+  Command is a type error, and GenICam's `<pIsDone>` polling is not implemented
+  anywhere in this library, so the only honest report is that the write was
+  acknowledged. That limitation is now documented rather than implied.
+
 - **The GVSP packet size is now probed against the network path, not just the
   device** (backlog `SR-13`,
   [#112](https://github.com/VitalyVorobyev/viva-genicam/issues/112)).
@@ -58,6 +321,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   register clamp cannot express. Without it `SR-13` would have been untestable.
 
 ### Fixed
+
+- **Breaking (behaviour): big-endian masked registers were read off the wrong
+  end** (backlog `GA-22`,
+  [#120](https://github.com/VitalyVorobyev/viva-genicam/issues/120), reported on
+  a FLIR BFS-PGE-31S4C-C). Writing `ExposureTime` was refused locally as
+  `node unavailable` on a camera that SpinView, Spinnaker and `arv-tool` all
+  write. Two separate defects in the same path, neither of which produced an
+  error, a warning or a skipped node:
+
+  1. **Bit numbering.** GenICam counts `<LSB>`, `<MSB>` and `<Bit>` from the
+     **most** significant bit when a register declares
+     `<Endianess>BigEndian</Endianess>`. The XML layer converted the index as
+     though it were LSB-relative and `bitops` converted it again, so the two
+     cancelled out. **9 473** big-endian single-bit fields across the vendor
+     corpus were read from the wrong end.
+  2. **Element casing.** `parsers::numeric` matched only `<Lsb>`/`<Msb>`, while
+     all 1 419 declarations in corpus register nodes use the schema spelling
+     `<LSB>`/`<MSB>`. Those registers therefore carried **no bit range at all**
+     and returned their entire register value — **1 374** fields across the
+     corpus.
+
+  On the reporter's camera, `ExposureTime` gates on three `<MaskedIntReg>`
+  predicates sharing one big-endian word at `0x000C1000` (bits 0, 1 and 3 from
+  the MSB). All three read as zero, so the feature looked unimplemented and every
+  setter refused before anything reached the wire — which is why setting
+  `ExposureAuto=Off` first made no difference.
+
+  **This did not need hardware to settle.** `AVT_Manta_G125B.xml` declares
+  bootstrap `GevSCPSPacketSize` at `0xD04` as `<LSB>31</LSB><MSB>16</MSB>`
+  big-endian; GigE Vision fixes the packet size as the low 16 bits; and the
+  reporter's own diagnostic bundle shows that register holding `0x40000578`,
+  i.e. 1400 bytes. Counted from the MSB that yields 1400, and our reading yielded
+  16384. The corpus agrees independently — 1 307 big-endian declarations with
+  `LSB > MSB` and none the other way, 41 little-endian with `LSB < MSB` and none
+  the other way — and so does aravis.
+
+  `<Mask>` deliberately keeps the endianness conversion: a mask is a literal
+  register value and so is LSB-relative by construction. It has zero corpus
+  occurrences, which is exactly why it now has its own test.
+
+  **A consequence worth stating plainly:** the `pIsLocked` guard added for
+  [#45](https://github.com/VitalyVorobyev/viva-genicam/issues/45) can never have
+  fired on that reporter's camera. It was reading bit 3 from the wrong end and
+  always saw zero.
+
+- **GenApi XML beginning with a UTF-8 byte-order mark loaded as an empty
+  nodemap** ([#122](https://github.com/VitalyVorobyev/viva-genicam/issues/122),
+  reported on a The Imaging Source DMK 33GP2000e). A BOM is valid UTF-8, so it
+  survived `String::from_utf8` and reached the parser. quick-xml removes it from
+  its own view of the input but does **not** advance `Reader::buffer_position`,
+  and `viva_genapi_xml::parse` slices each node element out of the caller's
+  `&str` by exactly those offsets — so every slice started three bytes early,
+  lost the closing `>` of its end tag, and was recorded as unparsable. The
+  failure was quiet in the worst way: `parse` returned `Ok`, the offset-free
+  top-level scan listed all 291 features correctly, and then every single node
+  was skipped, which is what the reporter saw. The BOM is now stripped in both
+  `parse` and `parse_into_minimal_nodes`.
+
+  The reporter's XML is in the vendor corpus as `TIS_DMK_33GP2000e.xml`; it is
+  the only document there that opens with a BOM, which is why nothing caught
+  this earlier. Its one remaining skipped node — a `<Register>` with `<pLength>`
+  — is the separate, known `GA-09` phase-two gap and is unaffected by this fix.
+
+  The element slice is now taken with `str::get` rather than by indexing. No
+  corpus document reaches a non-character-boundary index, so this is defensive
+  only: it makes any future offset disagreement cost one skipped feature instead
+  of panicking part-way through a camera connect.
 
 - **The GVSP path probe did not write its own answer back, leaving the camera
   configured at a size it had merely tested** (backlog `SR-15`,
@@ -93,6 +423,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ADR-0019 exists for.
 
 ### Testing
+
+- **The fake camera can now disagree with us about bit numbering** (backlog
+  `GA-22`, ADR-0019). Every predicate in `viva-fake-gige` was an
+  `<IntSwissKnife>` or a `<StructEntry>`, and both took the code path that was
+  already correct — so the whole suite passed while `<MaskedIntReg>` read real
+  cameras' registers off the wrong end. `ExposureTime` now gates on big-endian
+  `<MaskedIntReg>` + `<Bit>` predicates over a FLIR-shaped feature-status word,
+  and reverting the fix fails two `predicates.rs` tests instead of none.
+
+- **The XML corpus test asserts that a declared bit range survives parsing.**
+  Dropping one is silent by construction — the node still parses and simply
+  reads its whole register — so no skip list could have caught the casing defect
+  above. The check is per document rather than a corpus-wide total, because the
+  fetch script warns and continues when a third-party URL is unreachable and a
+  size-keyed assertion would fail for reasons unrelated to the parser. Reverting
+  the fix fails 24 of the 38 documents.
+
+- **Two test fixtures encoded the defect rather than catching it.**
+  `parse_integer_bitfield_big_endian` and the `BeBits` nodemap fixture both used
+  a big-endian `<Lsb>`/`<Msb>` pair oriented against its own byte order — a shape
+  that appears **zero** times in the vendor corpus. Both now use real vendor
+  shapes, and the numbers they assert come from the GigE Vision register layout
+  rather than from our own output.
+
+- **The fake camera has `UserSetSelector` and `UserSetLoad`** — its first
+  `<Command>` that reaches its register through `<pValue>` rather than a bare
+  `<Address>`. All 432 `<Command>` nodes in the vendor XML corpus use `<pValue>`
+  and all three of the fake's used the direct-address path, so the integration
+  suite exercised only the path no real camera takes (backlog `GA-10`).
+  `UserSetLoad` restores the analog-control defaults, so a test can move a
+  feature, execute the command, and read the change back off the device — a
+  command that only acknowledges its write can be "verified" by a test that
+  proves nothing (ADR-0019).
+
 
 - **`test_fake_gvsp_packets_match_spec_layout`** (backlog `TC-04`,
   [#63](https://github.com/VitalyVorobyev/viva-genicam/issues/63)) asserts the
@@ -1009,7 +1373,8 @@ Initial public release of the viva-genicam workspace.
 - `viva-fake-gige` -- In-process fake GigE Vision camera for self-contained integration testing (no external dependencies required)
 - `viva-fake-u3v` -- In-process fake USB3 Vision camera for testing
 
-[Unreleased]: https://github.com/VitalyVorobyev/viva-genicam/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/VitalyVorobyev/viva-genicam/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/VitalyVorobyev/viva-genicam/releases/tag/v0.5.0
 [0.4.1]: https://github.com/VitalyVorobyev/viva-genicam/releases/tag/v0.4.1
 [0.4.0]: https://github.com/VitalyVorobyev/viva-genicam/releases/tag/v0.4.0
 [0.3.1]: https://github.com/VitalyVorobyev/viva-genicam/releases/tag/v0.3.1

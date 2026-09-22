@@ -104,6 +104,47 @@ cam.enum_entries("PixelFormat")
 # ['Mono8', 'Mono16', 'BayerRG8', 'RGB8Packed']
 ```
 
+### Executing commands
+
+Some features are *actions*, not values — `UserSetLoad`, `TimestampLatch`,
+`TriggerSoftware`. `node_info(name).kind == "Command"` identifies one, and
+`execute` runs it:
+
+```python
+cam.set("UserSetSelector", "Default")
+cam.execute("UserSetLoad")            # restore the camera's default settings
+```
+
+Commands carry no value; the camera acts on the write itself. `cam.get()` on a
+Command raises, and there is nothing to read back.
+
+Three things worth knowing:
+
+- `cam.set("UserSetLoad", "1")` does the same thing and always has — `set`
+  dispatches Command nodes and discards the value. It was never documented,
+  which is what [issue #121](https://github.com/VitalyVorobyev/viva-genicam/issues/121)
+  reported. Prefer `execute`; it says what it does.
+- **A read after the command will be stale, and waiting will not fix it.** We do
+  not parse `<pInvalidator>`, so nothing tells the cached nodemap that
+  `UserSetLoad` just changed `ExposureTime`, `Gain` and the rest. The camera *is*
+  updated; the stale value is ours. Until that is implemented, **reconnect** if
+  you need to read the new settings back:
+
+  ```python
+  cam.execute("UserSetLoad")
+  cam = vg.connect_gige(info)     # fresh nodemap; a sleep will not do it
+  ```
+
+- **Separately**, GenICam's `pIsDone` polling is **not implemented**. `execute`
+  returns when the register write is acknowledged, not when the camera has
+  finished acting on it. That one a short sleep *does* help with.
+
+From the command line:
+
+```bash
+viva-camctl execute --name UserSetLoad --ip <CAMERA-IP>
+```
+
 ### Categories
 
 ```python

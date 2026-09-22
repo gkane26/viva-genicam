@@ -3,11 +3,12 @@ name = "viva-fake-u3v"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "In-process USB3 Vision fake camera for testing viva-genicam without hardware"
 repository.workspace = true
 rust-version.workspace = true
 publish = false
 
 [dependencies]
 bytes = { workspace = true }
-viva-u3v = { version = "0.4", path = "../viva-u3v" }
-viva-gencp = { version = "0.4", path = "../viva-gencp" }
+viva-u3v = { version = "0.5", path = "../viva-u3v" }
+viva-gencp = { version = "0.5", path = "../viva-gencp" }

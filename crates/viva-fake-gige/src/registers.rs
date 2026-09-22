@@ -41,15 +41,20 @@
 //! | `0x20060`   | 4      | GevTimestampTickFrequency (RO)  | u32 BE   |
 //! | `0x20068`   | 8      | GevTimestampValue (RO)          | u64 BE   |
 //! | `0x20070`   | 4      | TimestampLatch (command)        | u32 BE   |
+//! | `0x20078`   | 8      | GevIEEE1588OffsetFromMaster…    | u64 BE   |
 //! | `0x20080`   | 4      | ChunkModeActive                 | u32 BE   |
 //! | `0x20084`   | 4      | ChunkSelector                   | u32 BE   |
 //! | `0x20088`   | 4      | ChunkEnable                     | u32 BE   |
 //! | `0x200a0`   | 4      | EventSelector                   | u32 BE   |
 //! | `0x200a4`   | 4      | EventNotification (per selector)| u32 BE   |
+//! | `0x200a8`   | 4      | UserSetSelector                 | u32 BE   |
+//! | `0x200ac`   | 4      | UserSetLoad (command, pValue)   | u32 BE   |
 //! | `0x20100`   | 4      | WidthMin (RO)                   | u32 BE   |
 //! | `0x20104`   | 4      | WidthMax (RO)                   | u32 BE   |
 //! | `0x20108`   | 4      | HeightMin (RO)                  | u32 BE   |
 //! | `0x2010c`   | 4      | HeightMax (RO)                  | u32 BE   |
+//! | `0x20110`   | 8      | ChunkTimestamp_Val (RO)         | u64 **LE** |
+//! | `0x20118`   | 4      | ChunkWidth_Val (RO)             | u32 **LE** |
 //! | `0x20200`   | 32     | DeviceModelName (RO)            | string   |
 //! | `0x20220`   | 32     | DeviceVendorName (RO)           | string   |
 //! | `0x20240`   | 16     | DeviceSerialNumber (RO)         | string   |
@@ -157,12 +162,55 @@ pub const REG_TIMESTAMP_FREQ: u64 = 0x20060;
 pub const REG_TIMESTAMP_VALUE: u64 = 0x20068;
 pub const REG_TIMESTAMP_LATCH: u64 = 0x20070;
 
+/// A PTP offset-from-master, copied in shape from the FLIR BFS-PGE-31S4C-C
+/// description in the corpus (`<Length>8</Length>`, `<Sign>Unsigned</Sign>`,
+/// `<Endianess>BigEndian</Endianess>`). It is the node issue #140 was filed
+/// against, and it is declared unsigned although a clock offset is signed by
+/// nature — so its top bit is set whenever the slave leads the master. That
+/// combination is what made the node unreadable.
+pub const REG_PTP_OFFSET_LATCHED: u64 = 0x20078;
+
+/// Chunk value registers, declared **little-endian** exactly as FLIR, Point
+/// Grey and Hikrobot declare theirs. 311 plain `<IntReg>` declarations across
+/// 16 of the 38 corpus documents are of this shape; before GA-28 every one of
+/// them decoded byte-swapped, and nothing in the tree could notice.
+pub const REG_CHUNK_TIMESTAMP_LE: u64 = 0x20110;
+pub const REG_CHUNK_WIDTH_LE: u64 = 0x20118;
+
+/// Value latched into [`REG_PTP_OFFSET_LATCHED`]: the slave leading the master
+/// by 1 234 567 ns. Stored as the two's-complement bit pattern a camera would
+/// put on the wire, so the test asserts the bytes and the decoded value
+/// separately rather than round-tripping through our own codec.
+pub const PTP_OFFSET_NS: i64 = -1_234_567;
+
+/// Value latched into [`REG_CHUNK_TIMESTAMP_LE`]. Chosen so that reading it in
+/// the wrong byte order yields a plausible positive number
+/// (`0x7856_3412_0000_0000`) rather than an error — a byte-order defect that
+/// announces itself is not the one that shipped.
+pub const CHUNK_TIMESTAMP_TICKS: u64 = 0x0000_0000_1234_5678;
+
+/// Value latched into [`REG_CHUNK_WIDTH_LE`]. Most of the 311 are 4 bytes
+/// wide, so the common width gets its own node.
+pub const CHUNK_WIDTH_PX: u32 = 1440;
+
 /// Chunk data registers.
 pub const REG_CHUNK_MODE_ACTIVE: u64 = 0x20080;
 pub const REG_CHUNK_SELECTOR: u64 = 0x20084;
 pub const REG_CHUNK_ENABLE: u64 = 0x20088;
 
 /// `EventSelector` backing register: a GigE Vision event identifier.
+/// `REG_FEATURE_STATUS` is a FLIR-shaped feature-status word: one big-endian
+/// register whose individual bits say whether a feature is implemented,
+/// available and locked, addressed by `<MaskedIntReg>` + `<Bit>`.
+///
+/// It exists so the fake can disagree with us about bit numbering. Every other
+/// predicate here is an `<IntSwissKnife>` or a `<StructEntry>`, and both of
+/// those took the code path that was already correct — so the whole suite
+/// passed while `<MaskedIntReg>` read big-endian registers off the wrong end on
+/// real hardware (issue #120). GenICam counts `<Bit>` from the MSB on a
+/// big-endian register, so bit 0 is `0x8000_0000`.
+pub const REG_FEATURE_STATUS: u64 = 0x2009c;
+
 pub const REG_EVENT_SELECTOR: u64 = 0x200a0;
 /// `EventNotification` backing register for the selected event (0 = Off, 1 = On).
 ///
@@ -171,6 +219,21 @@ pub const REG_EVENT_SELECTOR: u64 = 0x200a0;
 /// of enabled event ids rather than by one stored word. Query it with
 /// [`RegisterMap::event_notification_on`].
 pub const REG_EVENT_NOTIFICATION: u64 = 0x200a4;
+
+/// `REG_USER_SET_SELECTOR` and `REG_USER_SET_LOAD` back the SFNC user-set
+/// features, so the fake can answer the workflow issue #121 was filed about.
+///
+/// `UserSetLoad` is also the fake's first command that reaches its register
+/// through `<pValue>` rather than a bare `<Address>`. That matters for backlog
+/// `GA-10`: all 432 `<Command>` nodes in the vendor corpus use `<pValue>`, and
+/// until now all three of the fake's used the direct-address path — so our
+/// integration tests exercised only the path no real camera takes.
+/// Exposure the fake boots with, and returns to on `UserSetLoad`.
+pub const DEFAULT_EXPOSURE_US: f64 = 5000.0;
+
+pub const REG_USER_SET_SELECTOR: u64 = 0x200a8;
+/// See [`REG_USER_SET_SELECTOR`].
+pub const REG_USER_SET_LOAD: u64 = 0x200ac;
 
 /// Limit registers.
 pub const REG_WIDTH_MIN: u64 = 0x20100;
@@ -229,6 +292,13 @@ pub const FAKE_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
     <pFeature>AnalogControl</pFeature>
     <pFeature>TransportLayerControl</pFeature>
     <pFeature>ChunkDataControl</pFeature>
+    <pFeature>UserSetControl</pFeature>
+  </Category>
+
+  <Category Name="UserSetControl">
+    <DisplayName>User Set Control</DisplayName>
+    <pFeature>UserSetSelector</pFeature>
+    <pFeature>UserSetLoad</pFeature>
   </Category>
 
   <Category Name="DeviceControl">
@@ -275,6 +345,9 @@ pub const FAKE_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
     <pFeature>GevTimestampTickFrequency</pFeature>
     <pFeature>GevTimestampValue</pFeature>
     <pFeature>TimestampLatch</pFeature>
+    <pFeature>GevIEEE1588OffsetFromMasterLatched_Val</pFeature>
+    <pFeature>ChunkTimestamp_Val</pFeature>
+    <pFeature>ChunkWidth_Val</pFeature>
   </Category>
 
   <Category Name="ChunkDataControl">
@@ -529,6 +602,24 @@ pub const FAKE_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
     <Endianess>BigEndian</Endianess>
   </Command>
 
+  <Enumeration Name="UserSetSelector" NameSpace="Standard">
+    <ToolTip>User set that UserSetLoad restores</ToolTip>
+    <EnumEntry Name="Default"><Value>0</Value></EnumEntry>
+    <EnumEntry Name="UserSet0"><Value>1</Value></EnumEntry>
+    <pValue>UserSetSelectorReg</pValue>
+  </Enumeration>
+  <IntReg Name="UserSetSelectorReg"><Address>0x200a8</Address><Length>4</Length><AccessMode>RW</AccessMode><Sign>Unsigned</Sign><Endianess>BigEndian</Endianess></IntReg>
+
+  <!-- Reaches its register through <pValue>, unlike the three commands above.
+       That is the shape every <Command> in the vendor corpus uses, and the one
+       our tests had no example of (backlog GA-10). -->
+  <Command Name="UserSetLoad" NameSpace="Standard">
+    <ToolTip>Restore the selected user set</ToolTip>
+    <pValue>UserSetLoadReg</pValue>
+    <CommandValue>1</CommandValue>
+  </Command>
+  <IntReg Name="UserSetLoadReg"><Address>0x200ac</Address><Length>4</Length><AccessMode>WO</AccessMode><Sign>Unsigned</Sign><Endianess>BigEndian</Endianess></IntReg>
+
   <Command Name="AcquisitionStop" NameSpace="Standard">
     <ToolTip>Stop image acquisition</ToolTip>
     <Address>0x20028</Address>
@@ -565,8 +656,24 @@ pub const FAKE_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
     <Min>10.0</Min>
     <Max>1000000.0</Max>
     <Endianess>BigEndian</Endianess>
+    <pIsImplemented>ExposureTime_Imp</pIsImplemented>
+    <pIsAvailable>ExposureTime_Avl</pIsAvailable>
     <pIsLocked>ExposureAutoActive</pIsLocked>
   </Float>
+
+  <!-- Feature-status bits in one big-endian word, the shape FLIR ships and the
+       shape that exposed issue #120. GenICam counts <Bit> from the MSB here, so
+       bit 0 is 0x80000000 and bit 1 is 0x40000000; the fake boots this register
+       to 0xC0000000. Read from the wrong end these both come out zero and
+       ExposureTime becomes unavailable, which is what the reporter saw. -->
+  <MaskedIntReg Name="ExposureTime_Imp">
+    <Address>0x2009c</Address><Length>4</Length><AccessMode>RO</AccessMode>
+    <Bit>0</Bit><Sign>Unsigned</Sign><Endianess>BigEndian</Endianess>
+  </MaskedIntReg>
+  <MaskedIntReg Name="ExposureTime_Avl">
+    <Address>0x2009c</Address><Length>4</Length><AccessMode>RO</AccessMode>
+    <Bit>1</Bit><Sign>Unsigned</Sign><Endianess>BigEndian</Endianess>
+  </MaskedIntReg>
 
   <Enumeration Name="ExposureAuto" NameSpace="Standard">
     <ToolTip>Automatic exposure control</ToolTip>
@@ -645,6 +752,33 @@ pub const FAKE_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
     <Sign>Unsigned</Sign>
     <Endianess>BigEndian</Endianess>
   </Integer>
+
+  <IntReg Name="GevIEEE1588OffsetFromMasterLatched_Val" NameSpace="Custom">
+    <ToolTip>PTP offset from master in ns, latched</ToolTip>
+    <Address>0x20078</Address>
+    <Length>8</Length>
+    <AccessMode>RO</AccessMode>
+    <Sign>Unsigned</Sign>
+    <Endianess>BigEndian</Endianess>
+  </IntReg>
+
+  <IntReg Name="ChunkTimestamp_Val" NameSpace="Custom">
+    <ToolTip>Chunk timestamp in ticks</ToolTip>
+    <Address>0x20110</Address>
+    <Length>8</Length>
+    <AccessMode>RO</AccessMode>
+    <Sign>Unsigned</Sign>
+    <Endianess>LittleEndian</Endianess>
+  </IntReg>
+
+  <IntReg Name="ChunkWidth_Val" NameSpace="Custom">
+    <ToolTip>Chunk image width in pixels</ToolTip>
+    <Address>0x20118</Address>
+    <Length>4</Length>
+    <AccessMode>RO</AccessMode>
+    <Sign>Unsigned</Sign>
+    <Endianess>LittleEndian</Endianess>
+  </IntReg>
 
   <Command Name="TimestampLatch" NameSpace="Standard">
     <ToolTip>Latch the current timestamp into GevTimestampValue</ToolTip>
@@ -862,9 +996,14 @@ impl RegisterMap {
         // ── Acquisition control ─────────────────────────────────────────
         regs.insert(REG_ACQ_MODE, 0u32.to_be_bytes().to_vec()); // Continuous
         regs.insert(REG_ACQ_START, vec![0, 0, 0, 0]);
+        regs.insert(REG_USER_SET_SELECTOR, 0u32.to_be_bytes().to_vec()); // Default
+        regs.insert(REG_USER_SET_LOAD, 0u32.to_be_bytes().to_vec());
         regs.insert(REG_ACQ_STOP, vec![0, 0, 0, 0]);
         regs.insert(REG_ACQ_FRAME_RATE, 30.0f32.to_be_bytes().to_vec());
-        regs.insert(REG_EXPOSURE_TIME, 5000.0f64.to_be_bytes().to_vec());
+        regs.insert(
+            REG_EXPOSURE_TIME,
+            DEFAULT_EXPOSURE_US.to_be_bytes().to_vec(),
+        );
         regs.insert(REG_EXPOSURE_AUTO, 0u32.to_be_bytes().to_vec()); // Off
 
         // ── Analog control ──────────────────────────────────────────────
@@ -881,11 +1020,23 @@ impl RegisterMap {
         // Capability bits, MSB-first as GenICam counts them on a big-endian
         // register: bit 0 = frame rate control present, bit 1 = chunk support.
         regs.insert(REG_DEVICE_CAPS, 0xC000_0000u32.to_be_bytes().to_vec());
+        // ExposureTime implemented (bit 0) and available (bit 1), MSB-first —
+        // see REG_FEATURE_STATUS.
+        regs.insert(REG_FEATURE_STATUS, 0xC000_0000u32.to_be_bytes().to_vec());
 
         // ── Timestamp (1 GHz tick frequency) ────────────────────────────
         regs.insert(REG_TIMESTAMP_FREQ, 1_000_000_000u32.to_be_bytes().to_vec());
         regs.insert(REG_TIMESTAMP_VALUE, vec![0u8; 8]);
         regs.insert(REG_TIMESTAMP_LATCH, vec![0, 0, 0, 0]);
+        regs.insert(
+            REG_PTP_OFFSET_LATCHED,
+            (PTP_OFFSET_NS as u64).to_be_bytes().to_vec(),
+        );
+        regs.insert(
+            REG_CHUNK_TIMESTAMP_LE,
+            CHUNK_TIMESTAMP_TICKS.to_le_bytes().to_vec(),
+        );
+        regs.insert(REG_CHUNK_WIDTH_LE, CHUNK_WIDTH_PX.to_le_bytes().to_vec());
 
         // ── Chunk data ──────────────────────────────────────────────────
         regs.insert(REG_CHUNK_MODE_ACTIVE, 0u32.to_be_bytes().to_vec());
@@ -1134,6 +1285,28 @@ impl RegisterMap {
             self.regs
                 .insert(REG_TIMESTAMP_VALUE, ts.to_be_bytes().to_vec());
         }
+        if addr == REG_USER_SET_LOAD {
+            self.load_user_set();
+        }
+    }
+
+    /// Restore the analog-control defaults, as `UserSetLoad` does on a real
+    /// camera.
+    ///
+    /// A command that only acknowledges the write is untestable: a test could
+    /// assert nothing beyond the absence of an error, which is the fake
+    /// agreeing with itself. Restoring observable device state means a test can
+    /// change a feature, execute the command, and read the change back out
+    /// (ADR-0019).
+    fn load_user_set(&mut self) {
+        self.regs.insert(
+            REG_EXPOSURE_TIME,
+            DEFAULT_EXPOSURE_US.to_be_bytes().to_vec(),
+        );
+        self.regs.insert(REG_GAIN, 0.0f64.to_be_bytes().to_vec());
+        self.regs
+            .insert(REG_EXPOSURE_AUTO, 0u32.to_be_bytes().to_vec());
+        self.regs.insert(REG_GAIN_AUTO, 0u32.to_be_bytes().to_vec());
     }
 
     // ── Accessors ───────────────────────────────────────────────────────

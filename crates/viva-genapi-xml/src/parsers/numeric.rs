@@ -5,9 +5,9 @@ use quick_xml::events::{BytesStart, Event};
 
 use super::{
     NodeMetaBuilder, SelectorState, TAG_BIT, TAG_BYTE_ORDER, TAG_ENDIANESS, TAG_ENDIANNESS,
-    TAG_LSB, TAG_MASK, TAG_MSB, TAG_P_ADDRESS, TAG_P_INDEX, TAG_VALUE, handle_addressing_empty,
-    handle_addressing_start, handle_p_selected_empty, handle_p_selected_start,
-    handle_predicate_start, handle_selected_empty, handle_selected_start,
+    TAG_LSB, TAG_LSB_MIXED, TAG_MASK, TAG_MSB, TAG_MSB_MIXED, TAG_P_ADDRESS, TAG_P_INDEX,
+    TAG_VALUE, handle_addressing_empty, handle_addressing_start, handle_p_selected_empty,
+    handle_p_selected_start, handle_predicate_start, handle_selected_empty, handle_selected_start,
 };
 use crate::builders::{AddressingBuilder, BitfieldBuilder, addressing_lengths};
 use crate::util::{
@@ -21,12 +21,12 @@ pub fn parse_integer(
     reader: &mut Reader<&[u8]>,
     start: BytesStart<'_>,
 ) -> Result<NodeDecl, XmlError> {
-    let name = attribute_value_required(&start, b"Name")?;
+    let name = attribute_value_required(&start, "Name")?;
     let mut addressing = AddressingBuilder::default();
-    if let Some(addr) = attribute_value(&start, b"Address")? {
+    if let Some(addr) = attribute_value(&start, "Address")? {
         addressing.push_fixed_address(parse_u64(&addr)?);
     }
-    if let Some(len) = attribute_value(&start, b"Length")? {
+    if let Some(len) = attribute_value(&start, "Length")? {
         let value = parse_u64(&len)?;
         let len = u32::try_from(value)
             .map_err(|_| XmlError::Invalid(format!("length out of range for node {name}")))?;
@@ -34,6 +34,7 @@ pub fn parse_integer(
     }
     let mut access = AccessMode::RW;
     let mut sign = Sign::default();
+    let mut byte_order: Option<ByteOrder> = None;
     let mut min = None;
     let mut max = None;
     let mut inc = None;
@@ -46,7 +47,7 @@ pub fn parse_integer(
     let mut predicates = PredicateRefs::default();
     let mut selector_state = SelectorState::default();
     let mut meta_builder = NodeMetaBuilder::default();
-    let node_name = start.name().as_ref().to_vec();
+    let node_name = start.name().as_ref().to_string();
     let mut buf = Vec::new();
     let mut bitfield = BitfieldBuilder::default();
     let mut pending_bit_length = false;
@@ -54,21 +55,21 @@ pub fn parse_integer(
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) => match e.name().as_ref() {
-                b"pValue" => {
+                "pValue" => {
                     let text = read_text_start(reader, e)?;
                     let target = text.trim();
                     if !target.is_empty() {
                         pvalue = Some(target.to_string());
                     }
                 }
-                b"pMax" => {
+                "pMax" => {
                     let text = read_text_start(reader, e)?;
                     let target = text.trim();
                     if !target.is_empty() {
                         p_max = Some(target.to_string());
                     }
                 }
-                b"pMin" => {
+                "pMin" => {
                     let text = read_text_start(reader, e)?;
                     let target = text.trim();
                     if !target.is_empty() {
@@ -88,10 +89,10 @@ pub fn parse_integer(
                 }
                 // Shared handling so `<Address>`, `<pAddress>` and
                 // `<pIndex>` all contribute their term.
-                b"Address" | TAG_P_ADDRESS | TAG_P_INDEX => {
+                "Address" | TAG_P_ADDRESS | TAG_P_INDEX => {
                     handle_addressing_start(reader, e, &name, &mut addressing)?;
                 }
-                b"Length" => {
+                "Length" => {
                     let text = read_text_start(reader, e)?;
                     let value = parse_u64(&text)?;
                     let mut handled = false;
@@ -113,36 +114,36 @@ pub fn parse_integer(
                         addressing.apply_length(len);
                     }
                 }
-                b"Sign" => {
+                "Sign" => {
                     let text = read_text_start(reader, e)?;
                     if let Some(parsed) = Sign::parse(&text) {
                         sign = parsed;
                     }
                 }
-                b"AccessMode" => {
+                "AccessMode" => {
                     let text = read_text_start(reader, e)?;
                     access = AccessMode::parse(&text)?;
                 }
-                b"Min" => {
+                "Min" => {
                     let text = read_text_start(reader, e)?;
                     min = Some(parse_i64(&text)?);
                 }
-                b"Max" => {
+                "Max" => {
                     let text = read_text_start(reader, e)?;
                     max = Some(parse_i64(&text)?);
                 }
-                b"Inc" => {
+                "Inc" => {
                     let text = read_text_start(reader, e)?;
                     inc = Some(parse_i64(&text)?);
                 }
-                b"Unit" => {
+                "Unit" => {
                     let text = read_text_start(reader, e)?;
                     let trimmed = text.trim();
                     if !trimmed.is_empty() {
                         unit = Some(trimmed.to_string());
                     }
                 }
-                TAG_LSB => {
+                TAG_LSB | TAG_LSB_MIXED => {
                     let text = read_text_start(reader, e)?;
                     let value = parse_u64(&text)?;
                     let lsb = u32::try_from(value).map_err(|_| {
@@ -150,7 +151,7 @@ pub fn parse_integer(
                     })?;
                     bitfield.note_lsb(lsb);
                 }
-                TAG_MSB => {
+                TAG_MSB | TAG_MSB_MIXED => {
                     let text = read_text_start(reader, e)?;
                     let value = parse_u64(&text)?;
                     let msb = u32::try_from(value).map_err(|_| {
@@ -176,13 +177,16 @@ pub fn parse_integer(
                 TAG_ENDIANNESS | TAG_ENDIANESS | TAG_BYTE_ORDER => {
                     let text = read_text_start(reader, e)?;
                     if let Some(order) = ByteOrder::parse(&text) {
+                        // Both: the bitfield needs it to place the bits, and an
+                        // unmasked register has no bitfield to hold it at all.
                         bitfield.note_byte_order(order);
+                        byte_order = Some(order);
                     }
                 }
-                b"pSelected" => {
+                "pSelected" => {
                     handle_p_selected_start(reader, e, &mut addressing, &mut selector_state)?;
                 }
-                b"Selected" => {
+                "Selected" => {
                     handle_selected_start(reader, e, &name, &mut addressing, &mut selector_state)?;
                 }
                 _ => {
@@ -194,13 +198,13 @@ pub fn parse_integer(
                 }
             },
             Ok(Event::Empty(ref e)) => match e.name().as_ref() {
-                b"pSelected" => {
+                "pSelected" => {
                     handle_p_selected_empty(e, &mut addressing, &mut selector_state)?;
                 }
                 TAG_P_ADDRESS => {
                     handle_addressing_empty(e, &mut addressing)?;
                 }
-                TAG_LSB => {
+                TAG_LSB | TAG_LSB_MIXED => {
                     if let Some(value) = attribute_value(e, TAG_VALUE)? {
                         let parsed = parse_u64(&value)?;
                         let lsb = u32::try_from(parsed).map_err(|_| {
@@ -209,7 +213,7 @@ pub fn parse_integer(
                         bitfield.note_lsb(lsb);
                     }
                 }
-                TAG_MSB => {
+                TAG_MSB | TAG_MSB_MIXED => {
                     if let Some(value) = attribute_value(e, TAG_VALUE)? {
                         let parsed = parse_u64(&value)?;
                         let msb = u32::try_from(parsed).map_err(|_| {
@@ -240,14 +244,15 @@ pub fn parse_integer(
                         && let Some(order) = ByteOrder::parse(&value)
                     {
                         bitfield.note_byte_order(order);
+                        byte_order = Some(order);
                     }
                 }
-                b"Selected" => {
+                "Selected" => {
                     handle_selected_empty(e, &name, &mut addressing, &mut selector_state)?;
                 }
                 _ => {}
             },
-            Ok(Event::End(ref e)) if e.name().as_ref() == node_name.as_slice() => break,
+            Ok(Event::End(ref e)) if e.name().as_ref() == node_name.as_str() => break,
             Ok(Event::Eof) => {
                 return Err(XmlError::Invalid(format!(
                     "unterminated Integer node {name}"
@@ -291,6 +296,7 @@ pub fn parse_integer(
         unit,
         bitfield,
         sign,
+        byte_order: byte_order.unwrap_or(ByteOrder::Big),
         selectors,
         selected_if,
         pvalue,
@@ -313,14 +319,14 @@ pub fn parse_float(
     reader: &mut Reader<&[u8]>,
     start: BytesStart<'_>,
 ) -> Result<NodeDecl, XmlError> {
-    let name = attribute_value_required(&start, b"Name")?;
-    let node_name = start.name().as_ref().to_vec();
-    let is_float_reg = node_name.as_slice() == b"FloatReg";
+    let name = attribute_value_required(&start, "Name")?;
+    let node_name = start.name().as_ref().to_string();
+    let is_float_reg = node_name.as_str() == "FloatReg";
     let mut addressing = AddressingBuilder::default();
-    if let Some(addr) = attribute_value(&start, b"Address")? {
+    if let Some(addr) = attribute_value(&start, "Address")? {
         addressing.push_fixed_address(parse_u64(&addr)?);
     }
-    if let Some(len) = attribute_value(&start, b"Length")? {
+    if let Some(len) = attribute_value(&start, "Length")? {
         let value = parse_u64(&len)?;
         let len = u32::try_from(value)
             .map_err(|_| XmlError::Invalid(format!("length out of range for node {name}")))?;
@@ -343,52 +349,52 @@ pub fn parse_float(
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) => match e.name().as_ref() {
-                b"pValue" => {
+                "pValue" => {
                     let text = read_text_start(reader, e)?;
                     let target = text.trim();
                     if !target.is_empty() {
                         pvalue = Some(target.to_string());
                     }
                 }
-                b"Address" | TAG_P_ADDRESS | TAG_P_INDEX | b"Length" => {
+                "Address" | TAG_P_ADDRESS | TAG_P_INDEX | "Length" => {
                     if !handle_addressing_start(reader, e, &name, &mut addressing)? {
                         skip_element(reader, e.name().as_ref())?;
                     }
                 }
-                b"AccessMode" => {
+                "AccessMode" => {
                     let text = read_text_start(reader, e)?;
                     access = AccessMode::parse(&text)?;
                 }
-                b"Min" => {
+                "Min" => {
                     let text = read_text_start(reader, e)?;
                     min = Some(parse_f64(&text)?);
                 }
-                b"Max" => {
+                "Max" => {
                     let text = read_text_start(reader, e)?;
                     max = Some(parse_f64(&text)?);
                 }
-                b"Unit" => {
+                "Unit" => {
                     let text = read_text_start(reader, e)?;
                     let trimmed = text.trim();
                     if !trimmed.is_empty() {
                         unit = Some(trimmed.to_string());
                     }
                 }
-                b"Scale" => {
+                "Scale" => {
                     let text = read_text_start(reader, e)?;
                     let (num, den) = parse_scale(&text)?;
                     scale_num = Some(num);
                     scale_den = Some(den);
                 }
-                b"ScaleNumerator" => {
+                "ScaleNumerator" => {
                     let text = read_text_start(reader, e)?;
                     scale_num = Some(parse_i64(&text)?);
                 }
-                b"ScaleDenominator" => {
+                "ScaleDenominator" => {
                     let text = read_text_start(reader, e)?;
                     scale_den = Some(parse_i64(&text)?);
                 }
-                b"Offset" => {
+                "Offset" => {
                     let text = read_text_start(reader, e)?;
                     offset = Some(parse_f64(&text)?);
                 }
@@ -398,10 +404,10 @@ pub fn parse_float(
                         byte_order = Some(order);
                     }
                 }
-                b"pSelected" => {
+                "pSelected" => {
                     handle_p_selected_start(reader, e, &mut addressing, &mut selector_state)?;
                 }
-                b"Selected" => {
+                "Selected" => {
                     handle_selected_start(reader, e, &name, &mut addressing, &mut selector_state)?;
                 }
                 _ => {
@@ -413,18 +419,18 @@ pub fn parse_float(
                 }
             },
             Ok(Event::Empty(ref e)) => match e.name().as_ref() {
-                b"pSelected" => {
+                "pSelected" => {
                     handle_p_selected_empty(e, &mut addressing, &mut selector_state)?;
                 }
                 TAG_P_ADDRESS => {
                     handle_addressing_empty(e, &mut addressing)?;
                 }
-                b"Selected" => {
+                "Selected" => {
                     handle_selected_empty(e, &name, &mut addressing, &mut selector_state)?;
                 }
                 _ => {}
             },
-            Ok(Event::End(ref e)) if e.name().as_ref() == node_name.as_slice() => break,
+            Ok(Event::End(ref e)) if e.name().as_ref() == node_name.as_str() => break,
             Ok(Event::Eof) => {
                 return Err(XmlError::Invalid(format!("unterminated Float node {name}")));
             }
