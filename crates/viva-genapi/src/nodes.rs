@@ -209,14 +209,6 @@ pub struct IntegerNode {
     pub bitfield: Option<BitField>,
     /// Whether the register payload is signed. GenICam defaults to unsigned.
     pub sign: Sign,
-    /// Byte order for the plain (non-bitfield) whole-register decode/encode
-    /// path (`bytes_to_i64`/`i64_to_bytes`). A node with `bitfield` present
-    /// carries its own byte order there instead, used for LSB/MSB bit-offset
-    /// resolution — this field is what a plain `<Integer>`/`<IntReg>` (no
-    /// bitfield) needs, and was previously missing entirely: every such node
-    /// was decoded as if it were always `BigEndian`, regardless of what its
-    /// XML declared.
-    pub byte_order: ByteOrder,
     /// Selector nodes controlling the visibility of this node.
     pub selectors: Vec<String>,
     /// Selector gating rules in the form `(selector, allowed values)`.

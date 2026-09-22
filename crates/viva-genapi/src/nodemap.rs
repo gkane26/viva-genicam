@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet, hash_map::Entry as HashMapEntry};
 
 use tracing::{debug, trace, warn};
 use viva_genapi_xml::{
-    AccessMode, AddressTerm, Addressing, ByteOrder, EnumEntryDecl, EnumValueSrc, FloatEncoding,
+    AccessMode, AddressTerm, Addressing, EnumEntryDecl, EnumValueSrc, FloatEncoding,
     FormulaBindings, IndexOffset, NodeDecl, PredicateRefs, Sign, SkippedNode, Visibility, XmlModel,
 };
 
@@ -271,7 +271,7 @@ impl NodeMap {
                 integer_sign(node).is_signed(),
             )?
         } else {
-            bytes_to_i64(name, &raw, integer_sign(node), node.byte_order)?
+            bytes_to_i64(name, &raw, integer_sign(node))?
         };
         debug!(node = %name, raw = value, "read integer feature");
         node.cache.replace(Some(value));
@@ -322,7 +322,7 @@ impl NodeMap {
             node.cache.replace(Some(value));
             node.raw_cache.replace(Some(raw));
         } else {
-            let bytes = i64_to_bytes(name, value, len, integer_sign(node), node.byte_order)?;
+            let bytes = i64_to_bytes(name, value, len, integer_sign(node))?;
             debug!(node = %name, raw = value, "write integer feature");
             io.write(address, &bytes).map_err(|err| match err {
                 GenApiError::Io(_) => err,
@@ -423,7 +423,7 @@ impl NodeMap {
             FloatEncoding::ScaledInteger => {
                 // `<Float>`/`<FloatReg>` declare no `<Sign>`; a scaled raw
                 // value is conventionally signed so an offset can go either way.
-                let raw_value = bytes_to_i64(name, &raw, Sign::Signed, node.byte_order)?;
+                let raw_value = bytes_to_i64(name, &raw, Sign::Signed)?;
                 let v = apply_scale(node, raw_value as f64);
                 debug!(node = %name, raw = raw_value, value = v, "read float feature (scaled)");
                 v
@@ -470,7 +470,7 @@ impl NodeMap {
             }
             FloatEncoding::ScaledInteger => {
                 let raw = encode_float(node, value)?;
-                let bytes = i64_to_bytes(name, raw, len, Sign::Signed, node.byte_order)?;
+                let bytes = i64_to_bytes(name, raw, len, Sign::Signed)?;
                 debug!(node = %name, raw, value, "write float feature (scaled)");
                 bytes
             }
@@ -513,15 +513,7 @@ impl NodeMap {
             other => other,
         })?;
         // `<Enumeration>` declares no `<Sign>`; entry values may be negative.
-        // KNOWN GAP: `EnumNode` has no `byte_order` field yet (unlike
-        // `IntegerNode`/`FloatNode`), so a LittleEndian-declared enum's
-        // underlying register would misdecode the same way Integer nodes
-        // did before this fix. Not observed on real hardware yet — PixelFormat
-        // is the only Enum this codebase's callers rely on, and it's read
-        // through a raw-register bypass on affected cameras instead of this
-        // path. Fix analogously (thread byte_order through NodeDecl::Enum /
-        // EnumNode / build_node) if a real LittleEndian enum register turns up.
-        let raw_value = bytes_to_i64(name, &raw, Sign::Signed, ByteOrder::Big)?;
+        let raw_value = bytes_to_i64(name, &raw, Sign::Signed)?;
         let entry = self.lookup_enum_entry(node, raw_value, io)?;
         debug!(node = %name, raw = raw_value, entry = %entry, "read enum feature");
         node.value_cache.replace(Some(entry.clone()));
@@ -572,8 +564,7 @@ impl NodeMap {
                 entry: entry.to_string(),
             })?;
         let raw = self.resolve_enum_entry_value(node, entry_decl, io)?;
-        // KNOWN GAP: see the matching note in `get_enum` above.
-        let bytes = i64_to_bytes(name, raw, len, Sign::Signed, ByteOrder::Big)?;
+        let bytes = i64_to_bytes(name, raw, len, Sign::Signed)?;
         debug!(node = %name, raw, entry, "write enum feature");
         io.write(address, &bytes).map_err(|err| match err {
             GenApiError::Io(_) => err,
@@ -915,11 +906,7 @@ impl NodeMap {
                 "command node {name} has zero length"
             )));
         }
-        // KNOWN GAP: `CommandNode` has no `byte_order` field yet — see the
-        // matching note on `get_enum` above; not observed to matter on real
-        // hardware yet (`AcquisitionStart`/`Stop` are single-bit commands
-        // where byte order is moot).
-        let data = i64_to_bytes(name, cmd_value, node.len, Sign::Signed, ByteOrder::Big)?;
+        let data = i64_to_bytes(name, cmd_value, node.len, Sign::Signed)?;
         debug!(node = %name, "execute command");
         io.write(address, &data).map_err(|err| match err {
             GenApiError::Io(_) => err,
@@ -1724,7 +1711,6 @@ fn build_node(
             unit,
             bitfield,
             sign,
-            byte_order,
             selectors,
             selected_if,
             pvalue,
@@ -1768,7 +1754,6 @@ fn build_node(
                 unit,
                 bitfield,
                 sign,
-                byte_order,
                 selectors,
                 selected_if,
                 pvalue,

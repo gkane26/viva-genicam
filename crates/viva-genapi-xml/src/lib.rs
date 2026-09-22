@@ -631,15 +631,6 @@ pub enum NodeDecl {
         /// Whether the register payload is signed. Defaults to unsigned.
         #[serde(default)]
         sign: Sign,
-        /// Byte order of the register payload, for the plain (non-bitfield)
-        /// decode/encode path. Defaults to [`ByteOrder::Big`] (the GenICam
-        /// default), same as `<Float>`/`<FloatReg>`. A node with a `bitfield`
-        /// present carries its own `byte_order` there instead (used for
-        /// LSB/MSB bit-offset resolution); this field is what the plain
-        /// whole-register `bytes_to_i64`/`i64_to_bytes` path uses when no
-        /// bitfield applies.
-        #[serde(default = "default_big_endian")]
-        byte_order: ByteOrder,
         /// Selector nodes referencing this feature.
         selectors: Vec<String>,
         /// Selector gating rules in the form (selector name, allowed values).
