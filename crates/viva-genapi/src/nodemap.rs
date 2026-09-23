@@ -1236,6 +1236,17 @@ impl NodeMap {
     /// `default`, and erring with the same wording `resolve_address`'s
     /// `BySelector` arm uses for an unmatched selector value if there is no
     /// default either.
+    ///
+    /// Known scope limit: `<pValueIndexed Index="N">`'s `N` is a plain
+    /// integer per the construct's own definition, so this only matches a
+    /// selector `get_selector_value` renders the same way -- an Integer
+    /// node. An Enum-typed `<pIndex>` would render as its symbolic entry
+    /// name instead (what `Addressing::BySelector`'s own map is keyed by,
+    /// which is the case that method exists for) and so would never match
+    /// any entry here, always falling through to `default`/erroring. Every
+    /// `<pValueIndexed>` in the vendor corpus and the one confirmed real
+    /// device (a Teledyne DALSA Genie Nano's `gainAddr`) uses an Integer
+    /// selector; revisit this if an Enum-selector case ever surfaces.
     fn resolve_value_source(
         &self,
         name: &str,

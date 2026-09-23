@@ -345,7 +345,9 @@ mod tests {
         ]);
 
         assert_eq!(
-            nodemap.get_integer("Multiplexer", &io).expect("read via EntryA"),
+            nodemap
+                .get_integer("Multiplexer", &io)
+                .expect("read via EntryA"),
             111,
             "Selector=10 must route to EntryA"
         );
@@ -354,7 +356,9 @@ mod tests {
             .set_integer("Selector", 20, &io)
             .expect("set selector to 20");
         assert_eq!(
-            nodemap.get_integer("Multiplexer", &io).expect("read via EntryB"),
+            nodemap
+                .get_integer("Multiplexer", &io)
+                .expect("read via EntryB"),
             222,
             "Selector=20 must route to EntryB"
         );
@@ -363,7 +367,9 @@ mod tests {
             .set_integer("Selector", 99, &io)
             .expect("set selector to an unmapped value");
         assert_eq!(
-            nodemap.get_integer("Multiplexer", &io).expect("read via default"),
+            nodemap
+                .get_integer("Multiplexer", &io)
+                .expect("read via default"),
             999,
             "an unmapped selector value must fall back to <pValueDefault>"
         );
