@@ -1558,6 +1558,10 @@ mod tests {
     /// evaluation entirely with "function ROUND expects 1 args, got 2"
     /// before this — confirmed against real hardware.
     #[test]
+    // `3.14159` is the real Nano formula's literal constant, not a
+    // mistyped `PI` -- ROUND needs a value with real digits past its
+    // rounding point to test anything.
+    #[allow(clippy::approx_constant)]
     fn round_accepts_an_optional_digits_argument() {
         assert!((eval_expr("ROUND(3.14159, 2)", &[]) - 3.14).abs() < 1e-9);
         assert!((eval_expr("ROUND(3.14159, 0)", &[]) - 3.0).abs() < 1e-9);
@@ -1572,10 +1576,15 @@ mod tests {
     #[test]
     fn round_rejects_more_than_two_arguments() {
         let ast = parse_expression("ROUND(1, 2, 3)").expect("parse failed");
-        let mut resolver =
-            |name: &str| -> Result<Value, EvalError> { Err(EvalError::UnknownVariable(name.to_string())) };
-        let err = evaluate(&ast, &mut resolver, EvalMode::Float).expect_err("ROUND must reject 3 arguments");
-        assert!(err.to_string().contains("ROUND"), "error should name ROUND: {err}");
+        let mut resolver = |name: &str| -> Result<Value, EvalError> {
+            Err(EvalError::UnknownVariable(name.to_string()))
+        };
+        let err = evaluate(&ast, &mut resolver, EvalMode::Float)
+            .expect_err("ROUND must reject 3 arguments");
+        assert!(
+            err.to_string().contains("ROUND"),
+            "error should name ROUND: {err}"
+        );
     }
 
     #[test]

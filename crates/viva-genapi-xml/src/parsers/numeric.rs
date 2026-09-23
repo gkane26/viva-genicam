@@ -14,7 +14,61 @@ use crate::util::{
     attribute_value, attribute_value_required, parse_f64, parse_i64, parse_scale, parse_u64,
     read_text_start, skip_element,
 };
-use crate::{AccessMode, ByteOrder, FloatEncoding, NodeDecl, PredicateRefs, Sign, XmlError};
+use crate::{
+    AccessMode, ByteOrder, FloatEncoding, NodeDecl, PredicateRefs, Sign, ValueSource, XmlError,
+};
+
+/// Accumulates `<pIndex>` + `<pValueIndexed>`/`<pValueDefault>` while parsing
+/// an `Integer`/`Float` node, and resolves them into a [`ValueSource::Indexed`].
+///
+/// `<pIndex>` does double duty in GenApi: paired with `<Address>`/
+/// `<pAddress>` it scales a register *address* (`AddressingBuilder::
+/// push_index`, still called for that side-effect wherever this builder's
+/// `note_index_selector` is); paired with `<pValueIndexed>` it instead picks
+/// *which node* supplies the value, with no register of its own. Both
+/// readings share the one `<pIndex>` element, so a node can only be told
+/// apart by whether `<pValueIndexed>` shows up too — this builder is what
+/// lets the caller decide that after the fact, once the whole node has been
+/// read.
+#[derive(Debug, Default)]
+struct IndexedValueBuilder {
+    selector: Option<String>,
+    entries: Vec<(i64, String)>,
+    default: Option<String>,
+}
+
+impl IndexedValueBuilder {
+    fn note_index_selector(&mut self, node: &str) {
+        self.selector = Some(node.to_string());
+    }
+
+    fn push_entry(&mut self, index: i64, target: &str) {
+        self.entries.push((index, target.to_string()));
+    }
+
+    fn set_default(&mut self, target: &str) {
+        self.default = Some(target.to_string());
+    }
+
+    /// Finalize into a `ValueSource::Indexed`, or `None` if no
+    /// `<pValueIndexed>` was ever seen (a plain `<pIndex>`-for-addressing
+    /// node, or no `<pIndex>` at all).
+    fn finish(self, node: &str) -> Result<Option<ValueSource>, XmlError> {
+        if self.entries.is_empty() {
+            return Ok(None);
+        }
+        let selector = self.selector.ok_or_else(|| {
+            XmlError::Invalid(format!(
+                "node {node} declares <pValueIndexed> without <pIndex>"
+            ))
+        })?;
+        Ok(Some(ValueSource::Indexed {
+            selector,
+            entries: self.entries,
+            default: self.default,
+        }))
+    }
+}
 
 /// Parse an `<Integer>` element into a [`NodeDecl::Integer`].
 pub fn parse_integer(
@@ -51,6 +105,7 @@ pub fn parse_integer(
     let mut buf = Vec::new();
     let mut bitfield = BitfieldBuilder::default();
     let mut pending_bit_length = false;
+    let mut indexed_value = IndexedValueBuilder::default();
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -60,6 +115,22 @@ pub fn parse_integer(
                     let target = text.trim();
                     if !target.is_empty() {
                         pvalue = Some(target.to_string());
+                    }
+                }
+                "pValueIndexed" => {
+                    let index_attr = attribute_value_required(e, "Index")?;
+                    let index = parse_i64(&index_attr)?;
+                    let text = read_text_start(reader, e)?;
+                    let target = text.trim();
+                    if !target.is_empty() {
+                        indexed_value.push_entry(index, target);
+                    }
+                }
+                "pValueDefault" => {
+                    let text = read_text_start(reader, e)?;
+                    let target = text.trim();
+                    if !target.is_empty() {
+                        indexed_value.set_default(target);
                     }
                 }
                 "pMax" => {
@@ -87,10 +158,24 @@ pub fn parse_integer(
                     let text = read_text_start(reader, e)?;
                     static_value = Some(parse_i64(&text)?);
                 }
-                // Shared handling so `<Address>`, `<pAddress>` and
-                // `<pIndex>` all contribute their term.
-                "Address" | TAG_P_ADDRESS | TAG_P_INDEX => {
+                // Shared handling so `<Address>` and `<pAddress>` both
+                // contribute their term.
+                "Address" | TAG_P_ADDRESS => {
                     handle_addressing_start(reader, e, &name, &mut addressing)?;
+                }
+                // `<pIndex>` does double duty (see `IndexedValueBuilder`'s
+                // doc comment) -- always contributed to `addressing` as
+                // before (for the address-scaling reading), but also noted
+                // here so a `<pValueIndexed>` elsewhere in this node can
+                // find its selector.
+                TAG_P_INDEX => {
+                    let offset = super::index_offset(e)?;
+                    let text = read_text_start(reader, e)?;
+                    let target = text.trim();
+                    if !target.is_empty() {
+                        addressing.push_index(target, offset);
+                        indexed_value.note_index_selector(target);
+                    }
                 }
                 "Length" => {
                     let text = read_text_start(reader, e)?;
@@ -204,6 +289,33 @@ pub fn parse_integer(
                 TAG_P_ADDRESS => {
                     handle_addressing_empty(e, &mut addressing)?;
                 }
+                TAG_P_INDEX => {
+                    if let Some(value) = attribute_value(e, "Name")? {
+                        let target = value.trim();
+                        if !target.is_empty() {
+                            addressing.push_index(target, super::index_offset(e)?);
+                            indexed_value.note_index_selector(target);
+                        }
+                    }
+                }
+                "pValueIndexed" => {
+                    if let (Some(index_attr), Some(target)) =
+                        (attribute_value(e, "Index")?, attribute_value(e, "Name")?)
+                    {
+                        let target = target.trim();
+                        if !target.is_empty() {
+                            indexed_value.push_entry(parse_i64(&index_attr)?, target);
+                        }
+                    }
+                }
+                "pValueDefault" => {
+                    if let Some(value) = attribute_value(e, "Name")? {
+                        let target = value.trim();
+                        if !target.is_empty() {
+                            indexed_value.set_default(target);
+                        }
+                    }
+                }
                 TAG_LSB | TAG_LSB_MIXED => {
                     if let Some(value) = attribute_value(e, TAG_VALUE)? {
                         let parsed = parse_u64(&value)?;
@@ -268,9 +380,18 @@ pub fn parse_integer(
     let min = min.unwrap_or(i64::MIN);
     let max = max.unwrap_or(i64::MAX);
 
-    // Addressing is optional: nodes may delegate via pValue, have a static
-    // Value, or appear as pure UI features without register backing.
-    let (addressing, len, bitfield) = if let Ok(addr) = addressing.finalize(&name, Some(4)) {
+    let indexed_value = indexed_value.finish(&name)?;
+
+    // Addressing is optional: nodes may delegate via pValue (direct or
+    // indexed), have a static Value, or appear as pure UI features without
+    // register backing. A `<pValueIndexed>` node has no addressing of its
+    // own even though its `<pIndex>` term above was accumulated into
+    // `addressing` too (for the address-scaling reading of that shared
+    // tag) -- indexed delegation wins outright, same as `<pValue>` already
+    // does below.
+    let (addressing, len, bitfield) = if indexed_value.is_some() {
+        (None, 4, bitfield.finish(&name, &[4]).ok().flatten())
+    } else if let Ok(addr) = addressing.finalize(&name, Some(4)) {
         let lengths = addressing_lengths(&addr);
         let len = lengths
             .first()
@@ -283,6 +404,7 @@ pub fn parse_integer(
         (None, 4, bitfield.finish(&name, &[4]).ok().flatten())
     };
     let (selectors, selected_if) = selector_state.into_parts();
+    let pvalue = indexed_value.or(pvalue.map(ValueSource::Direct));
 
     Ok(NodeDecl::Integer {
         name,
@@ -345,6 +467,7 @@ pub fn parse_float(
     let mut selector_state = SelectorState::default();
     let mut meta_builder = NodeMetaBuilder::default();
     let mut buf = Vec::new();
+    let mut indexed_value = IndexedValueBuilder::default();
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -356,7 +479,34 @@ pub fn parse_float(
                         pvalue = Some(target.to_string());
                     }
                 }
-                "Address" | TAG_P_ADDRESS | TAG_P_INDEX | "Length" => {
+                "pValueIndexed" => {
+                    let index_attr = attribute_value_required(e, "Index")?;
+                    let index = parse_i64(&index_attr)?;
+                    let text = read_text_start(reader, e)?;
+                    let target = text.trim();
+                    if !target.is_empty() {
+                        indexed_value.push_entry(index, target);
+                    }
+                }
+                "pValueDefault" => {
+                    let text = read_text_start(reader, e)?;
+                    let target = text.trim();
+                    if !target.is_empty() {
+                        indexed_value.set_default(target);
+                    }
+                }
+                // `<pIndex>` does double duty -- see `IndexedValueBuilder`'s
+                // doc comment on the Integer parser above.
+                TAG_P_INDEX => {
+                    let stride = super::index_offset(e)?;
+                    let text = read_text_start(reader, e)?;
+                    let target = text.trim();
+                    if !target.is_empty() {
+                        addressing.push_index(target, stride);
+                        indexed_value.note_index_selector(target);
+                    }
+                }
+                "Address" | TAG_P_ADDRESS | "Length" => {
                     if !handle_addressing_start(reader, e, &name, &mut addressing)? {
                         skip_element(reader, e.name().as_ref())?;
                     }
@@ -425,6 +575,33 @@ pub fn parse_float(
                 TAG_P_ADDRESS => {
                     handle_addressing_empty(e, &mut addressing)?;
                 }
+                TAG_P_INDEX => {
+                    if let Some(value) = attribute_value(e, "Name")? {
+                        let target = value.trim();
+                        if !target.is_empty() {
+                            addressing.push_index(target, super::index_offset(e)?);
+                            indexed_value.note_index_selector(target);
+                        }
+                    }
+                }
+                "pValueIndexed" => {
+                    if let (Some(index_attr), Some(target)) =
+                        (attribute_value(e, "Index")?, attribute_value(e, "Name")?)
+                    {
+                        let target = target.trim();
+                        if !target.is_empty() {
+                            indexed_value.push_entry(parse_i64(&index_attr)?, target);
+                        }
+                    }
+                }
+                "pValueDefault" => {
+                    if let Some(value) = attribute_value(e, "Name")? {
+                        let target = value.trim();
+                        if !target.is_empty() {
+                            indexed_value.set_default(target);
+                        }
+                    }
+                }
                 "Selected" => {
                     handle_selected_empty(e, &name, &mut addressing, &mut selector_state)?;
                 }
@@ -449,8 +626,17 @@ pub fn parse_float(
         _ => None,
     };
 
-    let addressing = addressing.finalize(&name, Some(8)).ok();
+    let indexed_value = indexed_value.finish(&name)?;
+    // Indexed delegation wins outright over whatever `addressing` picked up
+    // from the shared `<pIndex>` term -- see the matching comment in
+    // `parse_integer`.
+    let addressing = if indexed_value.is_some() {
+        None
+    } else {
+        addressing.finalize(&name, Some(8)).ok()
+    };
     let (selectors, selected_if) = selector_state.into_parts();
+    let pvalue = indexed_value.or(pvalue.map(ValueSource::Direct));
 
     let has_scale_or_offset = scale.is_some() || offset.is_some();
     let length = addressing.as_ref().and_then(addressing_primary_length);

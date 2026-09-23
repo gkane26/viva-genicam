@@ -265,6 +265,59 @@ pub enum Addressing {
     },
 }
 
+/// Where an `Integer`/`Float` node's value actually comes from.
+///
+/// `<pValue>` (`Direct`) is a single static delegate, unconditionally in
+/// effect. `<pIndex>` + one or more `<pValueIndexed Index="N">`, optionally
+/// with `<pValueDefault>` for an index with no matching entry, picks the
+/// delegate dynamically by a selector's current value (`Indexed`) — the
+/// same "switch by selector" shape `Addressing::BySelector` has for register
+/// addresses, but one level up: this picks *which node* provides the value,
+/// not an address within one node's own register.
+///
+/// A node with `Indexed` has no `Addressing` of its own (see `NodeDecl::
+/// Integer`'s `addressing` field doc) — same invariant as `Direct`, since
+/// both are delegation, not register backing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ValueSource {
+    /// `<pValue>Target</pValue>`.
+    Direct(String),
+    /// `<pIndex>Selector</pIndex>` + `<pValueIndexed Index="N">Target</pValueIndexed>` (one or more) +
+    /// optional `<pValueDefault>Target</pValueDefault>`.
+    Indexed {
+        /// Node whose current value selects an entry.
+        selector: String,
+        /// `(Index, target node)` pairs, in declaration order.
+        entries: Vec<(i64, String)>,
+        /// Target used when the selector's value matches no entry.
+        default: Option<String>,
+    },
+}
+
+impl ValueSource {
+    /// Names of every node this value source reads at resolution time.
+    ///
+    /// Used to build the invalidation graph, same purpose as `Addressing::
+    /// referenced_nodes`.
+    pub fn referenced_nodes(&self) -> Vec<&str> {
+        match self {
+            ValueSource::Direct(target) => vec![target.as_str()],
+            ValueSource::Indexed {
+                selector,
+                entries,
+                default,
+            } => {
+                let mut names = vec![selector.as_str()];
+                names.extend(entries.iter().map(|(_, target)| target.as_str()));
+                if let Some(target) = default {
+                    names.push(target.as_str());
+                }
+                names
+            }
+        }
+    }
+}
+
 /// One contribution to a register address.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AddressTerm {
@@ -640,8 +693,9 @@ pub enum NodeDecl {
         selectors: Vec<String>,
         /// Selector gating rules in the form (selector name, allowed values).
         selected_if: Vec<(String, Vec<String>)>,
-        /// Node providing the value (delegates read/write to another node).
-        pvalue: Option<String>,
+        /// Value source: a static `<pValue>` delegate, or a `<pIndex>` +
+        /// `<pValueIndexed>` dynamic one. See [`ValueSource`].
+        pvalue: Option<ValueSource>,
         /// Node providing the dynamic maximum.
         p_max: Option<String>,
         /// Node providing the dynamic minimum.
@@ -672,8 +726,9 @@ pub enum NodeDecl {
         offset: Option<f64>,
         selectors: Vec<String>,
         selected_if: Vec<(String, Vec<String>)>,
-        /// Node providing the value (delegates read/write to another node).
-        pvalue: Option<String>,
+        /// Value source: a static `<pValue>` delegate, or a `<pIndex>` +
+        /// `<pValueIndexed>` dynamic one. See [`ValueSource`].
+        pvalue: Option<ValueSource>,
         /// How the register payload should be interpreted — native IEEE 754
         /// or scaled integer. Defaults to [`FloatEncoding::ScaledInteger`] to
         /// preserve existing behaviour for XML that relied on it.
@@ -1420,6 +1475,165 @@ mod tests {
                 match &entries[1].value {
                     EnumValueSrc::FromNode(node) => assert_eq!(node, "RegModeVal"),
                     other => panic!("unexpected entry value: {other:?}"),
+                }
+            }
+            other => panic!("unexpected node: {other:?}"),
+        }
+    }
+
+    /// `<pIndex>` + `<pValueIndexed>` (optionally with `<pValueDefault>`)
+    /// picks the delegate node dynamically by a selector's value, rather
+    /// than the single static target `<pValue>` names. Modeled on the
+    /// `Multiplexer`/`FloatMultiplexer` nodes in `aravis_genicam.xml` (part
+    /// of the vendor corpus already, `fixtures/vendor-xml/`) -- a
+    /// construct a real Teledyne DALSA Genie Nano's GenApi XML also leans
+    /// on for its `Gain` feature's register-block selection, and which this
+    /// crate previously dropped silently (both `<pValueIndexed>` and
+    /// `<pValueDefault>` fell through the parser's unrecognized-tag
+    /// fallback with no error and no `skipped` bookkeeping).
+    #[test]
+    fn parse_integer_indexed_value_source() {
+        const XML: &str = r#"
+            <RegisterDescription SchemaMajorVersion="1" SchemaMinorVersion="0" SchemaSubMinorVersion="0">
+                <Integer Name="Selector">
+                    <Address>0x6000</Address>
+                    <Length>4</Length>
+                    <AccessMode>RW</AccessMode>
+                    <Min>0</Min>
+                    <Max>100</Max>
+                </Integer>
+                <Integer Name="EntryA">
+                    <Address>0x6100</Address>
+                    <Length>4</Length>
+                    <AccessMode>RW</AccessMode>
+                    <Min>0</Min>
+                    <Max>65535</Max>
+                </Integer>
+                <Integer Name="EntryB">
+                    <Address>0x6200</Address>
+                    <Length>4</Length>
+                    <AccessMode>RW</AccessMode>
+                    <Min>0</Min>
+                    <Max>65535</Max>
+                </Integer>
+                <Integer Name="DefaultEntry">
+                    <Address>0x6300</Address>
+                    <Length>4</Length>
+                    <AccessMode>RW</AccessMode>
+                    <Min>0</Min>
+                    <Max>65535</Max>
+                </Integer>
+                <Integer Name="Multiplexer">
+                    <pIndex>Selector</pIndex>
+                    <pValueIndexed Index="10">EntryA</pValueIndexed>
+                    <pValueIndexed Index="20">EntryB</pValueIndexed>
+                    <pValueDefault>DefaultEntry</pValueDefault>
+                </Integer>
+            </RegisterDescription>
+        "#;
+
+        let model = parse(XML).expect("parse indexed value source");
+        let multiplexer = model
+            .nodes
+            .iter()
+            .find(|n| matches!(n, NodeDecl::Integer { name, .. } if name == "Multiplexer"))
+            .expect("Multiplexer node");
+        match multiplexer {
+            NodeDecl::Integer {
+                pvalue, addressing, ..
+            } => {
+                // Indexed delegation wins outright: the shared `<pIndex>`
+                // element also contributes an address term (for its other,
+                // address-scaling job), but a `<pValueIndexed>` node has no
+                // register of its own -- same invariant `<pValue>` already
+                // has.
+                assert!(
+                    addressing.is_none(),
+                    "an indexed-value node must have no addressing of its own"
+                );
+                match pvalue {
+                    Some(ValueSource::Indexed {
+                        selector,
+                        entries,
+                        default,
+                    }) => {
+                        assert_eq!(selector, "Selector");
+                        assert_eq!(
+                            entries,
+                            &vec![(10, "EntryA".to_string()), (20, "EntryB".to_string())]
+                        );
+                        assert_eq!(default.as_deref(), Some("DefaultEntry"));
+                    }
+                    other => panic!("expected ValueSource::Indexed, got {other:?}"),
+                }
+            }
+            other => panic!("unexpected node: {other:?}"),
+        }
+    }
+
+    /// Same construct as [`parse_integer_indexed_value_source`], on a
+    /// `<Float>` node -- `aravis_genicam.xml`'s `FloatMultiplexer` declares
+    /// it too, and `ValueSource` is shared between the two node types.
+    #[test]
+    fn parse_float_indexed_value_source() {
+        const XML: &str = r#"
+            <RegisterDescription SchemaMajorVersion="1" SchemaMinorVersion="0" SchemaSubMinorVersion="0">
+                <Integer Name="Selector">
+                    <Address>0x7000</Address>
+                    <Length>4</Length>
+                    <AccessMode>RW</AccessMode>
+                    <Min>0</Min>
+                    <Max>100</Max>
+                </Integer>
+                <Float Name="EntryA">
+                    <Address>0x7100</Address>
+                    <Length>4</Length>
+                    <AccessMode>RW</AccessMode>
+                    <Min>0</Min>
+                    <Max>65535</Max>
+                </Float>
+                <Float Name="EntryB">
+                    <Address>0x7200</Address>
+                    <Length>4</Length>
+                    <AccessMode>RW</AccessMode>
+                    <Min>0</Min>
+                    <Max>65535</Max>
+                </Float>
+                <Float Name="FloatMultiplexer">
+                    <pIndex>Selector</pIndex>
+                    <pValueIndexed Index="10">EntryA</pValueIndexed>
+                    <pValueIndexed Index="20">EntryB</pValueIndexed>
+                </Float>
+            </RegisterDescription>
+        "#;
+
+        let model = parse(XML).expect("parse float indexed value source");
+        let multiplexer = model
+            .nodes
+            .iter()
+            .find(|n| matches!(n, NodeDecl::Float { name, .. } if name == "FloatMultiplexer"))
+            .expect("FloatMultiplexer node");
+        match multiplexer {
+            NodeDecl::Float {
+                pvalue, addressing, ..
+            } => {
+                assert!(addressing.is_none());
+                match pvalue {
+                    Some(ValueSource::Indexed {
+                        selector,
+                        entries,
+                        default,
+                    }) => {
+                        assert_eq!(selector, "Selector");
+                        assert_eq!(
+                            entries,
+                            &vec![(10, "EntryA".to_string()), (20, "EntryB".to_string())]
+                        );
+                        // No `<pValueDefault>` this time -- must stay `None`,
+                        // not silently default to the first/last entry.
+                        assert_eq!(*default, None);
+                    }
+                    other => panic!("expected ValueSource::Indexed, got {other:?}"),
                 }
             }
             other => panic!("unexpected node: {other:?}"),

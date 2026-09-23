@@ -6,7 +6,8 @@ use std::collections::{HashMap, HashSet, hash_map::Entry as HashMapEntry};
 use tracing::{debug, trace, warn};
 use viva_genapi_xml::{
     AccessMode, AddressTerm, Addressing, ByteOrder, EnumEntryDecl, EnumValueSrc, FloatEncoding,
-    FormulaBindings, IndexOffset, NodeDecl, PredicateRefs, Sign, SkippedNode, Visibility, XmlModel,
+    FormulaBindings, IndexOffset, NodeDecl, PredicateRefs, Sign, SkippedNode, ValueSource,
+    Visibility, XmlModel,
 };
 
 use crate::bitops::{extract, insert};
@@ -41,6 +42,19 @@ fn register_addressing_dependency(
     addressing: &Addressing,
 ) {
     for provider in addressing.referenced_nodes() {
+        dependents
+            .entry(provider.to_string())
+            .or_default()
+            .push(node_name.to_string());
+    }
+}
+
+fn register_value_source_dependency(
+    dependents: &mut HashMap<String, Vec<String>>,
+    node_name: &str,
+    source: &ValueSource,
+) {
+    for provider in source.referenced_nodes() {
         dependents
             .entry(provider.to_string())
             .or_default()
@@ -248,7 +262,8 @@ impl NodeMap {
         // Delegate to pValue node if present.
         if let Some(ref pv) = node.pvalue {
             let pv = pv.clone();
-            return self.get_integer(&pv, io);
+            let target = self.resolve_value_source(name, &pv, io)?;
+            return self.get_integer(&target, io);
         }
         let addressing = node
             .addressing
@@ -294,7 +309,8 @@ impl NodeMap {
         self.ensure_selectors(name, &node.selected_if, io)?;
         if let Some(ref pv) = node.pvalue {
             let pv = pv.clone();
-            return self.set_integer(&pv, value, io);
+            let target = self.resolve_value_source(name, &pv, io)?;
+            return self.set_integer(&target, value, io);
         }
         let addressing = node
             .addressing
@@ -349,7 +365,11 @@ impl NodeMap {
     /// = None`) for exactly the features callers most need real bounds for.
     /// `inc` is `None` when the camera declares neither form (GenICam
     /// permits an unconstrained increment).
-    pub fn integer_bounds(&self, name: &str, io: &dyn RegisterIo) -> Result<(i64, i64, Option<i64>), GenApiError> {
+    pub fn integer_bounds(
+        &self,
+        name: &str,
+        io: &dyn RegisterIo,
+    ) -> Result<(i64, i64, Option<i64>), GenApiError> {
         let node = self.get_integer_node(name)?;
         let mut stack = HashSet::new();
         let min = match &node.p_min {
@@ -363,7 +383,10 @@ impl NodeMap {
         };
         stack.clear();
         let inc = match &node.p_inc {
-            Some(provider) => Some(round_to_i64(name, self.resolve_numeric(provider, io, &mut stack)?)?),
+            Some(provider) => Some(round_to_i64(
+                name,
+                self.resolve_numeric(provider, io, &mut stack)?,
+            )?),
             None => node.inc,
         };
         Ok((min, max, inc))
@@ -400,7 +423,8 @@ impl NodeMap {
         self.ensure_selectors(name, &node.selected_if, io)?;
         if let Some(ref pv) = node.pvalue {
             let pv = pv.clone();
-            return self.get_float(&pv, io);
+            let target = self.resolve_value_source(name, &pv, io)?;
+            return self.get_float(&target, io);
         }
         let addressing = node
             .addressing
@@ -452,7 +476,8 @@ impl NodeMap {
         self.ensure_selectors(name, &node.selected_if, io)?;
         if let Some(ref pv) = node.pvalue {
             let pv = pv.clone();
-            return self.set_float(&pv, value, io);
+            let target = self.resolve_value_source(name, &pv, io)?;
+            return self.set_float(&target, value, io);
         }
         let addressing = node
             .addressing
@@ -1200,13 +1225,45 @@ impl NodeMap {
         }
     }
 
-    /// Bind a formula's declared variables and evaluate it.
+    /// Resolve an Integer/Float node's [`ValueSource`] to the target node
+    /// name to delegate to right now.
     ///
-    /// Shared by SwissKnife, Converter and IntConverter: they differ only in
-    /// which AST and variable list they hand over, in the arithmetic mode, and
-    /// in any variables the caller binds directly (`FROM` and `OLD` on a
-    /// write, which have no provider node to read).
-    #[allow(clippy::too_many_arguments)]
+    /// `Direct` names its target outright. `Indexed` reads its selector
+    /// through the same [`Self::get_selector_value`] `Addressing::
+    /// BySelector`'s own address resolution uses, then matches it against
+    /// `entries` by the `Index` value's decimal string (matching how
+    /// `get_selector_value` renders an Integer selector) -- falling back to
+    /// `default`, and erring with the same wording `resolve_address`'s
+    /// `BySelector` arm uses for an unmatched selector value if there is no
+    /// default either.
+    fn resolve_value_source(
+        &self,
+        name: &str,
+        source: &ValueSource,
+        io: &dyn RegisterIo,
+    ) -> Result<String, GenApiError> {
+        match source {
+            ValueSource::Direct(target) => Ok(target.clone()),
+            ValueSource::Indexed {
+                selector,
+                entries,
+                default,
+            } => {
+                let value = self.get_selector_value(selector, io)?;
+                entries
+                    .iter()
+                    .find(|(index, _)| index.to_string() == value)
+                    .map(|(_, target)| target.clone())
+                    .or_else(|| default.clone())
+                    .ok_or_else(|| {
+                        GenApiError::Unavailable(format!(
+                            "node '{name}' unavailable for selector '{selector}={value}'"
+                        ))
+                    })
+            }
+        }
+    }
+
     /// Resolve a single formula variable to the value the AST should see.
     ///
     /// A `<pVariable>` whose declared `Name` follows GenICam's
@@ -1229,17 +1286,28 @@ impl NodeMap {
                 Some(_) => return Err(GenApiError::Type(provider.to_string())),
                 None => return Err(GenApiError::NodeNotFound(provider.to_string())),
             };
-            let entry = node.entries.iter().find(|e| e.name == entry_name).ok_or_else(|| {
-                GenApiError::EnumNoSuchEntry {
+            let entry = node
+                .entries
+                .iter()
+                .find(|e| e.name == entry_name)
+                .ok_or_else(|| GenApiError::EnumNoSuchEntry {
                     node: provider.to_string(),
                     entry: entry_name.to_string(),
-                }
-            })?;
-            return self.resolve_enum_entry_value(node, entry, io).map(SkValue::Int);
+                })?;
+            return self
+                .resolve_enum_entry_value(node, entry, io)
+                .map(SkValue::Int);
         }
         self.resolve_value(provider, io, stack)
     }
 
+    /// Bind a formula's declared variables and evaluate it.
+    ///
+    /// Shared by SwissKnife, Converter and IntConverter: they differ only in
+    /// which AST and variable list they hand over, in the arithmetic mode, and
+    /// in any variables the caller binds directly (`FROM` and `OLD` on a
+    /// write, which have no provider node to read).
+    #[allow(clippy::too_many_arguments)]
     fn eval_formula(
         &self,
         name: &str,
@@ -1255,7 +1323,10 @@ impl NodeMap {
             if overrides.iter().any(|(ident, _)| ident == var) {
                 continue;
             }
-            values.insert(var.clone(), self.resolve_formula_var(var, provider, io, stack)?);
+            values.insert(
+                var.clone(),
+                self.resolve_formula_var(var, provider, io, stack)?,
+            );
         }
         for (ident, value) in overrides {
             values.insert((*ident).to_string(), *value);
@@ -1727,7 +1798,7 @@ fn build_node(
                 register_addressing_dependency(dependents, &name, addr);
             }
             if let Some(ref pv) = pvalue {
-                dependents.entry(pv.clone()).or_default().push(name.clone());
+                register_value_source_dependency(dependents, &name, pv);
             }
             if let Some(ref pm) = p_max {
                 dependents.entry(pm.clone()).or_default().push(name.clone());
@@ -1792,7 +1863,7 @@ fn build_node(
                 register_addressing_dependency(dependents, &name, addr);
             }
             if let Some(ref pv) = pvalue {
-                dependents.entry(pv.clone()).or_default().push(name.clone());
+                register_value_source_dependency(dependents, &name, pv);
             }
             for (selector, _) in &selected_if {
                 dependents

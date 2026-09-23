@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use viva_genapi_xml::{
-    AccessMode, Addressing, BitField, ByteOrder, EnumEntryDecl, FloatEncoding, Sign,
+    AccessMode, Addressing, BitField, ByteOrder, EnumEntryDecl, FloatEncoding, Sign, ValueSource,
 };
 pub use viva_genapi_xml::{NodeMeta, PredicateRefs, Representation, SkOutput, Visibility};
 
@@ -215,8 +215,9 @@ pub struct IntegerNode {
     pub selectors: Vec<String>,
     /// Selector gating rules in the form `(selector, allowed values)`.
     pub selected_if: Vec<(String, Vec<String>)>,
-    /// Node providing the value (delegates read/write).
-    pub pvalue: Option<String>,
+    /// Value source: a static `<pValue>` delegate, or a `<pIndex>` +
+    /// `<pValueIndexed>` dynamic one.
+    pub pvalue: Option<ValueSource>,
     /// Node providing the dynamic maximum.
     pub p_max: Option<String>,
     /// Node providing the dynamic minimum.
@@ -249,8 +250,9 @@ pub struct FloatNode {
     pub offset: Option<f64>,
     pub selectors: Vec<String>,
     pub selected_if: Vec<(String, Vec<String>)>,
-    /// Node providing the value (delegates read/write).
-    pub pvalue: Option<String>,
+    /// Value source: a static `<pValue>` delegate, or a `<pIndex>` +
+    /// `<pValueIndexed>` dynamic one.
+    pub pvalue: Option<ValueSource>,
     /// How the register payload is encoded (IEEE 754 or scaled integer).
     pub encoding: FloatEncoding,
     /// Byte order of the register payload.

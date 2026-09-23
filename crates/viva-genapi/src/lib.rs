@@ -287,6 +287,140 @@ mod tests {
         assert_eq!(skipped[0].name.as_deref(), Some("DeviceConfRom"));
     }
 
+    /// `<pIndex>` + `<pValueIndexed>` picks the register `Multiplexer`
+    /// delegates to at read/write time, by `Selector`'s current value --
+    /// falling back to `<pValueDefault>` for a value with no matching entry.
+    /// Same construct `aravis_genicam.xml` (vendor corpus) declares as
+    /// `Multiplexer`/`FloatMultiplexer`, and a real Teledyne DALSA Genie
+    /// Nano's `Gain` feature depends on for its own register-block
+    /// selection.
+    const INDEXED_VALUE_FIXTURE: &str = r#"
+        <RegisterDescription SchemaMajorVersion="1" SchemaMinorVersion="0" SchemaSubMinorVersion="0">
+            <Integer Name="Selector">
+                <Address>0x6000</Address>
+                <Length>4</Length>
+                <AccessMode>RW</AccessMode>
+                <Min>0</Min>
+                <Max>100</Max>
+            </Integer>
+            <Integer Name="EntryA">
+                <Address>0x6100</Address>
+                <Length>4</Length>
+                <AccessMode>RW</AccessMode>
+                <Min>0</Min>
+                <Max>65535</Max>
+            </Integer>
+            <Integer Name="EntryB">
+                <Address>0x6200</Address>
+                <Length>4</Length>
+                <AccessMode>RW</AccessMode>
+                <Min>0</Min>
+                <Max>65535</Max>
+            </Integer>
+            <Integer Name="DefaultEntry">
+                <Address>0x6300</Address>
+                <Length>4</Length>
+                <AccessMode>RW</AccessMode>
+                <Min>0</Min>
+                <Max>65535</Max>
+            </Integer>
+            <Integer Name="Multiplexer">
+                <pIndex>Selector</pIndex>
+                <pValueIndexed Index="10">EntryA</pValueIndexed>
+                <pValueIndexed Index="20">EntryB</pValueIndexed>
+                <pValueDefault>DefaultEntry</pValueDefault>
+            </Integer>
+        </RegisterDescription>
+    "#;
+
+    #[test]
+    fn get_integer_resolves_indexed_value_source_by_selector() {
+        let model = viva_genapi_xml::parse(INDEXED_VALUE_FIXTURE).expect("parse fixture");
+        let mut nodemap = NodeMap::try_from_xml(model).expect("build nodemap");
+        let io = MockIo::with_registers(&[
+            (0x6000, 10i32.to_be_bytes().to_vec()),
+            (0x6100, 111i32.to_be_bytes().to_vec()),
+            (0x6200, 222i32.to_be_bytes().to_vec()),
+            (0x6300, 999i32.to_be_bytes().to_vec()),
+        ]);
+
+        assert_eq!(
+            nodemap.get_integer("Multiplexer", &io).expect("read via EntryA"),
+            111,
+            "Selector=10 must route to EntryA"
+        );
+
+        nodemap
+            .set_integer("Selector", 20, &io)
+            .expect("set selector to 20");
+        assert_eq!(
+            nodemap.get_integer("Multiplexer", &io).expect("read via EntryB"),
+            222,
+            "Selector=20 must route to EntryB"
+        );
+
+        nodemap
+            .set_integer("Selector", 99, &io)
+            .expect("set selector to an unmapped value");
+        assert_eq!(
+            nodemap.get_integer("Multiplexer", &io).expect("read via default"),
+            999,
+            "an unmapped selector value must fall back to <pValueDefault>"
+        );
+
+        // Writes resolve through the same selector, not just reads.
+        nodemap
+            .set_integer("Multiplexer", 555, &io)
+            .expect("write via default (Selector still 99)");
+        assert_eq!(
+            nodemap
+                .get_integer("DefaultEntry", &io)
+                .expect("read DefaultEntry directly"),
+            555,
+            "writing Multiplexer while Selector=99 must land on DefaultEntry"
+        );
+    }
+
+    #[test]
+    fn get_integer_errs_for_unmapped_selector_with_no_default() {
+        const XML: &str = r#"
+            <RegisterDescription SchemaMajorVersion="1" SchemaMinorVersion="0" SchemaSubMinorVersion="0">
+                <Integer Name="Selector">
+                    <Address>0x6000</Address>
+                    <Length>4</Length>
+                    <AccessMode>RW</AccessMode>
+                    <Min>0</Min>
+                    <Max>100</Max>
+                </Integer>
+                <Integer Name="EntryA">
+                    <Address>0x6100</Address>
+                    <Length>4</Length>
+                    <AccessMode>RW</AccessMode>
+                    <Min>0</Min>
+                    <Max>65535</Max>
+                </Integer>
+                <Integer Name="Multiplexer">
+                    <pIndex>Selector</pIndex>
+                    <pValueIndexed Index="10">EntryA</pValueIndexed>
+                </Integer>
+            </RegisterDescription>
+        "#;
+        let model = viva_genapi_xml::parse(XML).expect("parse fixture");
+        let nodemap = NodeMap::try_from_xml(model).expect("build nodemap");
+        let io = MockIo::with_registers(&[
+            (0x6000, 99i32.to_be_bytes().to_vec()),
+            (0x6100, 1i32.to_be_bytes().to_vec()),
+        ]);
+
+        let err = nodemap
+            .get_integer("Multiplexer", &io)
+            .expect_err("Selector=99 matches no entry and there is no <pValueDefault>");
+        assert!(
+            matches!(err, GenApiError::Unavailable(_)),
+            "expected Unavailable, got {err:?}"
+        );
+    }
+
     /// `<Register>` fixture covering the three shapes GA-09's first cut cares
     /// about: a readable/writable block on the device port, one on a chunk
     /// port, and one whose length is resolved at runtime.
@@ -2162,7 +2296,9 @@ mod tests {
     fn integer_bounds_resolves_p_min_and_p_inc_dynamically() {
         let nodemap = build_dynamic_integer_bounds_nodemap();
         let io = MockIo::with_registers(&[(0x600, 3u32.to_be_bytes().to_vec())]); // FACTOR = 3
-        let (min, max, inc) = nodemap.integer_bounds("Width", &io).expect("resolve bounds");
+        let (min, max, inc) = nodemap
+            .integer_bounds("Width", &io)
+            .expect("resolve bounds");
         assert_eq!(min, 12, "DynMin = FACTOR * 4 = 3 * 4");
         assert_eq!(max, i64::MAX, "Width declares no <Max>/<pMax> at all");
         assert_eq!(inc, Some(6), "DynInc = FACTOR * 2 = 3 * 2");
@@ -2174,7 +2310,9 @@ mod tests {
         // pMin/pMax/pInc -- the fallback path this fixture doesn't exercise.
         let nodemap = build_predicate_nodemap();
         let io = predicate_io(1);
-        let (min, max, inc) = nodemap.integer_bounds("Gated", &io).expect("resolve bounds");
+        let (min, max, inc) = nodemap
+            .integer_bounds("Gated", &io)
+            .expect("resolve bounds");
         assert_eq!((min, max, inc), (0, 255, None));
     }
 }
